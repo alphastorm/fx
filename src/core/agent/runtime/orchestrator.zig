@@ -7677,6 +7677,7 @@ fn processQueuedPromptLoop(
         try runtime_tool_batch.appendFinalVerificationContinuationSuffix(
             config.final_verification_enabled,
             &final_verification_injected,
+            step_ctx,
             arena,
             &within_turn_suffix,
             &step_batch,

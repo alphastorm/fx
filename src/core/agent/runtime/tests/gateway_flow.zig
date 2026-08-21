@@ -5967,6 +5967,28 @@ test "processQueuedPrompt appends final verification once across repair mutation
     try std.testing.expectEqual(@as(usize, 1), countNeedle(gateway.request_bodies.items[2], prompt_prefix));
 }
 
+test "processQueuedPrompt excludes failed write results from final verification" {
+    const alloc = std.testing.allocator;
+    const calls = [_]ToolCall{toolCall("call_1", "write_file", "{\"path\":\"a\",\"content\":\"x\"}")};
+    const completions = [_]FakeCompletion{
+        .{ .tool_calls = &calls },
+        .{ .content = "Write failed" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    hooks.exec_plans = &.{.{ .result = .{
+        .status = .failure,
+        .model_output = "write failed",
+    } }};
+    var fixture = PromptFixture{};
+
+    try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
+
+    try expectBodyNotContains(&gateway, 1, "Before finalizing, verify");
+}
+
 test "processQueuedPrompt honors disabled final verification after mutation" {
     const alloc = std.testing.allocator;
     const calls = [_]ToolCall{toolCall("call_1", "write_file", "{\"path\":\"a\",\"content\":\"x\"}")};
@@ -5979,8 +6001,10 @@ test "processQueuedPrompt honors disabled final verification after mutation" {
     var hooks = FakeAgentRuntimeDeps.init(alloc);
     defer hooks.deinit();
     var fixture = PromptFixture{};
+    var config = fixture.config();
+    config.final_verification_enabled = false;
 
-    try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
+    try runFakePrompt(&gateway, &hooks, config, fixture.job());
 
     try expectBodyNotContains(&gateway, 1, "Before finalizing, verify");
 }
@@ -6035,6 +6059,7 @@ test "processQueuedPrompt trace records history shape returned tool calls and wa
     try std.testing.expect(std.mem.find(u8, trace, "event=after_permission_decision") != null);
     try std.testing.expect(std.mem.find(u8, trace, "event=before_tool_execution") != null);
     try std.testing.expect(std.mem.find(u8, trace, "event=after_tool_execution") != null);
+    try std.testing.expect(std.mem.find(u8, trace, "event=final_verification_injected") != null);
     try std.testing.expect(std.mem.find(u8, trace, "\"path\"") == null);
     try std.testing.expect(std.mem.find(u8, trace, "\"content\"") == null);
     try std.testing.expect(std.mem.find(u8, trace, "\"metadata\"") == null);

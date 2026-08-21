@@ -504,6 +504,7 @@ pub fn appendOrdinaryExecutedResult(
 pub fn appendFinalVerificationContinuationSuffix(
     enabled: bool,
     injected: *bool,
+    step_ctx: TraceContext,
     arena: Allocator,
     within_turn_suffix: *std.ArrayList(ChatMessage),
     batch: *const StepBatchState,
@@ -518,6 +519,13 @@ pub fn appendFinalVerificationContinuationSuffix(
         "discrepancy, then report concrete verification evidence.";
     try within_turn_suffix.append(arena, .{ .role = .user, .content = prompt });
     injected.* = true;
+    debug_trace.eventf(
+        "agent",
+        "final_verification_injected",
+        step_ctx,
+        "trigger=file_mutation",
+        .{},
+    );
 }
 
 test "appendPermissionFeedback marks typed approval feedback" {

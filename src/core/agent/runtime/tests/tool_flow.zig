@@ -4380,6 +4380,7 @@ test "committed file result is appended before degraded secondary publication" {
         model_output,
         "\"role\":\"user\"",
         "Summarize the committed change.",
+        "Before finalizing, verify",
     });
 }
 

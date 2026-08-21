@@ -35,7 +35,7 @@ pub const Config = struct {
     max_tool_result_bytes: usize = tool_result_limits.default_max_tool_result_bytes,
     step_limit_notice: []const u8 = default_step_limit_notice,
     cancel_flag: *std.atomic.Value(bool),
-    /// Inject one bounded verification reminder after a successful write/edit batch.
+    /// Inject one bounded verification reminder after an observed file mutation.
     final_verification_enabled: bool = true,
     fast_mode: bool = false,
     effort: ReasoningEffort = .auto,

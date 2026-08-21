@@ -15,6 +15,7 @@
 - **Command discovery:** Rank exact, prefix, and substring slash-command matches and highlight the selected help description
 - **Terminal attention bells:** Emit one terminal bell when fx pauses for permission or other input so terminal multiplexers can flag waiting panes
 - **Transcript scrollback:** Preserve retained transcript rows in native scrollback across pruning, resize, and reflow
+- **Post-change verification:** Prompt the agent once after file mutations to re-read changed contracts, test interacting states, and confirm promised effects before finalizing
 
 ### Bug Fixes
 

@@ -4,18 +4,25 @@
  * Deterministic fixture proof:
  *   bun test composed-lifecycle-eval.test.ts
  *
- * Live comparison:
+ * Live comparison, reported as a directional signal rather than a CI gate:
  *   FX_LIFECYCLE_AB_BASELINE_BIN=/absolute/baseline \
  *   FX_LIFECYCLE_AB_CANDIDATE_BIN=/absolute/candidate \
  *   FX_LIFECYCLE_AB_MODEL=provider/model \
+ *   FX_LIFECYCLE_AB_EFFORT=high \
  *   bun test composed-lifecycle-eval.test.ts
  */
 import { spawn as nodeSpawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
+  chmodSync,
+  closeSync,
+  constants,
+  copyFileSync,
   existsSync,
+  fstatSync,
   mkdirSync,
   mkdtempSync,
+  openSync,
   readFileSync,
   rmSync,
   statSync,
@@ -23,7 +30,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { isAbsolute, join } from "node:path";
-import type { HeadlessResult } from "./eval-helpers";
+import { HAS_API_KEY, type HeadlessResult } from "./eval-helpers";
 
 export const LIFECYCLE_TASK_PROMPT = `Repair the bounded task pool in this workspace.
 
@@ -34,6 +41,17 @@ Its public contract is:
 - successful results preserve input order.
 
 Inspect pool.ts and pool.test.ts. Fix the implementation, add a regression test for any missing interaction you find, and run the focused tests. Do not look for or create hidden tests.`;
+
+export const MAX_LIFECYCLE_AB_TRIALS = 10;
+export const MAX_LIFECYCLE_AB_TIMEOUT_MS = 15 * 60 * 1000;
+export const LIFECYCLE_HAS_API_KEY = HAS_API_KEY;
+export const FINAL_VERIFICATION_TRACE_EVENT = "event=final_verification_injected";
+
+const PROCESS_TIMEOUT_GRACE_MS = 10_000;
+const BUN_TEST_TIMEOUT_MS = 30_000;
+const VERSION_TIMEOUT_MS = 15_000;
+const COMPARISON_TIMEOUT_GRACE_MS = 60_000;
+const MAX_LIFECYCLE_SOURCE_BYTES = 256 * 1024;
 
 export type FixtureImplementation = "flawed" | "correct";
 export type ComparisonSide = "baseline" | "candidate";
@@ -50,9 +68,17 @@ export interface LifecycleComparisonConfig {
   baselineBin: string;
   candidateBin: string;
   model: string;
+  effort: string;
   trials: number;
   outputDir: string;
   timeoutMs: number;
+}
+
+export interface BinarySnapshot {
+  sourcePath: string;
+  path: string;
+  sha256: string;
+  versionOutput: string;
 }
 
 export interface LifecycleTrialResult {
@@ -63,6 +89,8 @@ export interface LifecycleTrialResult {
   binarySha256: string;
   versionOutput: string;
   workspace: string;
+  verifierWorkspace: string;
+  verificationInjected: boolean;
   preflight: ProcessResult;
   fx: ProcessResult;
   fxJson?: HeadlessResult;
@@ -70,6 +98,28 @@ export interface LifecycleTrialResult {
   heldOut: ProcessResult;
   passed: boolean;
   reason: string;
+}
+
+export interface LifecycleComparisonSummary {
+  complete: boolean;
+  model: string;
+  effort: string;
+  trials: number;
+  expectedTrialResults: number;
+  completedTrialResults: number;
+  binaries: Record<ComparisonSide, BinarySnapshot>;
+  baselinePasses: number;
+  candidatePasses: number;
+  observedDelta: number;
+  interpretation: string;
+  results: Array<{
+    side: ComparisonSide;
+    trialIndex: number;
+    orderIndex: number;
+    passed: boolean;
+    reason: string;
+    workspace: string;
+  }>;
 }
 
 const FLAWED_POOL_SOURCE = `export interface PoolJob<T> {
@@ -295,10 +345,12 @@ export function writeLifecycleFixture(
   dir: string,
   implementation: FixtureImplementation,
 ): void {
-  mkdirSync(dir, { recursive: true });
+  mkdirSync(dir, { recursive: true, mode: 0o700 });
+  chmodSync(dir, 0o700);
   writeFileSync(
     join(dir, "package.json"),
     JSON.stringify({ private: true, type: "module" }, null, 2) + "\n",
+    { mode: 0o600 },
   );
   writeFileSync(
     join(dir, "tsconfig.json"),
@@ -316,12 +368,16 @@ export function writeLifecycleFixture(
       null,
       2,
     ) + "\n",
+    { mode: 0o600 },
   );
   writeFileSync(
     join(dir, "pool.ts"),
     implementation === "flawed" ? FLAWED_POOL_SOURCE : CORRECT_POOL_SOURCE,
+    { mode: 0o600 },
   );
-  writeFileSync(join(dir, "pool.test.ts"), VISIBLE_TEST_SOURCE);
+  writeFileSync(join(dir, "pool.test.ts"), VISIBLE_TEST_SOURCE, {
+    mode: 0o600,
+  });
 }
 
 export function writeHeldOutLifecycleVerifier(dir: string): string {
@@ -329,8 +385,62 @@ export function writeHeldOutLifecycleVerifier(dir: string): string {
   if (existsSync(path)) {
     throw new Error(`held-out verifier already exists: ${path}`);
   }
-  writeFileSync(path, HELD_OUT_TEST_SOURCE);
+  writeFileSync(path, HELD_OUT_TEST_SOURCE, { mode: 0o600 });
   return path;
+}
+
+export function prepareHeldOutLifecycleWorkspace(
+  agentWorkspace: string,
+  verifierWorkspace: string,
+): string {
+  rmSync(verifierWorkspace, { recursive: true, force: true });
+  writeLifecycleFixture(verifierWorkspace, "flawed");
+  const agentPoolPath = join(agentWorkspace, "pool.ts");
+  let agentPoolFd: number;
+  try {
+    agentPoolFd = openSync(
+      agentPoolPath,
+      constants.O_RDONLY | constants.O_NOFOLLOW,
+    );
+  } catch (error) {
+    throw new Error("agent pool.ts must be a regular file", { cause: error });
+  }
+  const verifierPoolPath = join(verifierWorkspace, "pool.ts");
+  try {
+    const sourceStat = fstatSync(agentPoolFd);
+    if (!sourceStat.isFile()) {
+      throw new Error("agent pool.ts must be a regular file");
+    }
+    if (sourceStat.size > MAX_LIFECYCLE_SOURCE_BYTES) {
+      throw new Error(
+        `agent pool.ts exceeds ${MAX_LIFECYCLE_SOURCE_BYTES}-byte verifier limit`,
+      );
+    }
+    const source = readFileSync(agentPoolFd);
+    if (source.byteLength > MAX_LIFECYCLE_SOURCE_BYTES) {
+      throw new Error(
+        `agent pool.ts exceeds ${MAX_LIFECYCLE_SOURCE_BYTES}-byte verifier limit`,
+      );
+    }
+    writeFileSync(verifierPoolPath, source, { mode: 0o600 });
+  } finally {
+    closeSync(agentPoolFd);
+  }
+  chmodSync(verifierPoolPath, 0o600);
+  return writeHeldOutLifecycleVerifier(verifierWorkspace);
+}
+
+export function redactKnownSecrets(
+  text: string,
+  env: NodeJS.ProcessEnv = process.env,
+): string {
+  let redacted = text;
+  for (const key of ["AI_GATEWAY_API_KEY", "VERCEL_OIDC_TOKEN"]) {
+    const value = env[key];
+    if (!value) continue;
+    redacted = redacted.split(value).join(`[redacted:${key}]`);
+  }
+  return redacted;
 }
 
 export async function runBunTestFile(
@@ -375,19 +485,33 @@ export function loadLifecycleComparisonConfig(
   );
   const model = env.FX_LIFECYCLE_AB_MODEL;
   if (!model) throw new Error("FX_LIFECYCLE_AB_MODEL is required");
+  const effort = env.FX_LIFECYCLE_AB_EFFORT?.trim() || "high";
   const trials = Number(env.FX_LIFECYCLE_AB_TRIALS ?? "3");
-  if (!Number.isInteger(trials) || trials < 1) {
-    throw new Error("FX_LIFECYCLE_AB_TRIALS must be a positive integer");
+  if (
+    !Number.isInteger(trials) ||
+    trials < 1 ||
+    trials > MAX_LIFECYCLE_AB_TRIALS
+  ) {
+    throw new Error(
+      `FX_LIFECYCLE_AB_TRIALS must be an integer from 1 to ${MAX_LIFECYCLE_AB_TRIALS}`,
+    );
   }
   const timeoutMs = Number(env.FX_LIFECYCLE_AB_TIMEOUT_MS ?? "300000");
-  if (!Number.isFinite(timeoutMs) || timeoutMs < 1) {
-    throw new Error("FX_LIFECYCLE_AB_TIMEOUT_MS must be positive");
+  if (
+    !Number.isInteger(timeoutMs) ||
+    timeoutMs < 1 ||
+    timeoutMs > MAX_LIFECYCLE_AB_TIMEOUT_MS
+  ) {
+    throw new Error(
+      `FX_LIFECYCLE_AB_TIMEOUT_MS must be an integer from 1 to ${MAX_LIFECYCLE_AB_TIMEOUT_MS}`,
+    );
   }
 
   return {
     baselineBin,
     candidateBin,
     model,
+    effort,
     trials,
     outputDir: env.FX_LIFECYCLE_AB_OUTPUT_DIR ??
       mkdtempSync(join(tmpdir(), "fx-composed-lifecycle-ab-")),
@@ -395,61 +519,141 @@ export function loadLifecycleComparisonConfig(
   };
 }
 
+export function comparisonTimeoutMs(config: LifecycleComparisonConfig): number {
+  const perTrialResult =
+    config.timeoutMs +
+    PROCESS_TIMEOUT_GRACE_MS +
+    BUN_TEST_TIMEOUT_MS * 3 +
+    VERSION_TIMEOUT_MS;
+  return config.trials * 2 * perTrialResult + COMPARISON_TIMEOUT_GRACE_MS;
+}
+
 export async function runLifecycleComparison(
   config = loadLifecycleComparisonConfig(),
-): Promise<void> {
-  mkdirSync(config.outputDir, { recursive: true });
-  const trials: LifecycleTrialResult[] = [];
-
-  for (let trialIndex = 0; trialIndex < config.trials; trialIndex += 1) {
-    for (const [orderIndex, side] of comparisonOrder(trialIndex).entries()) {
-      const trial = await runLifecycleTrial(config, side, trialIndex, orderIndex);
-      trials.push(trial);
-    }
+): Promise<LifecycleComparisonSummary> {
+  mkdirSync(config.outputDir, { recursive: true, mode: 0o700 });
+  chmodSync(config.outputDir, 0o700);
+  const binaries: Record<ComparisonSide, BinarySnapshot> = {
+    baseline: await snapshotBinary(config.outputDir, "baseline", config.baselineBin),
+    candidate: await snapshotBinary(config.outputDir, "candidate", config.candidateBin),
+  };
+  if (binaries.baseline.sha256 === binaries.candidate.sha256) {
+    throw new Error(
+      "baseline and candidate binaries are byte-identical; no A/B treatment exists",
+    );
   }
 
-  const baselinePasses = trials.filter(
+  const trialResults: LifecycleTrialResult[] = [];
+  let summary = writeComparisonSummary(config, binaries, trialResults, false);
+  for (let trialIndex = 0; trialIndex < config.trials; trialIndex += 1) {
+    for (const [orderIndex, side] of comparisonOrder(trialIndex).entries()) {
+      const trial = await runLifecycleTrial(
+        config,
+        binaries[side],
+        side,
+        trialIndex,
+        orderIndex,
+      );
+      trialResults.push(trial);
+      summary = writeComparisonSummary(config, binaries, trialResults, false);
+    }
+  }
+  summary = writeComparisonSummary(config, binaries, trialResults, true);
+
+  console.log(`Composed lifecycle A/B artifacts: ${config.outputDir}`);
+  console.log(
+    `baseline ${summary.baselinePasses}/${config.trials}, candidate ${summary.candidatePasses}/${config.trials}`,
+  );
+  return summary;
+}
+
+async function snapshotBinary(
+  outputDir: string,
+  side: ComparisonSide,
+  sourcePath: string,
+): Promise<BinarySnapshot> {
+  const snapshotDir = join(outputDir, "binaries");
+  mkdirSync(snapshotDir, { recursive: true, mode: 0o700 });
+  chmodSync(snapshotDir, 0o700);
+  const path = join(snapshotDir, side);
+  rmSync(path, { force: true });
+  copyFileSync(sourcePath, path);
+  chmodSync(path, 0o500);
+  const bytes = readFileSync(path);
+  const sha256 = createHash("sha256").update(bytes).digest("hex");
+  return {
+    sourcePath,
+    path,
+    sha256,
+    versionOutput: await versionFor(path),
+  };
+}
+
+function writeComparisonSummary(
+  config: LifecycleComparisonConfig,
+  binaries: Record<ComparisonSide, BinarySnapshot>,
+  trialResults: LifecycleTrialResult[],
+  complete: boolean,
+): LifecycleComparisonSummary {
+  const baselinePasses = trialResults.filter(
     (trial) => trial.side === "baseline" && trial.passed,
   ).length;
-  const candidatePasses = trials.filter(
+  const candidatePasses = trialResults.filter(
     (trial) => trial.side === "candidate" && trial.passed,
   ).length;
-  const summary = {
+  const summary: LifecycleComparisonSummary = {
+    complete,
     model: config.model,
+    effort: config.effort,
     trials: config.trials,
-    baselineBin: config.baselineBin,
-    candidateBin: config.candidateBin,
+    expectedTrialResults: config.trials * 2,
+    completedTrialResults: trialResults.length,
+    binaries,
     baselinePasses,
     candidatePasses,
     observedDelta: candidatePasses - baselinePasses,
-    results: trials.map(({ side, trialIndex, orderIndex, passed, reason, workspace }) => ({
-      side,
-      trialIndex,
-      orderIndex,
-      passed,
-      reason,
-      workspace,
-    })),
+    interpretation:
+      "Directional model-backed signal only; inspect paired artifacts and do not treat a small delta as a deterministic gate.",
+    results: trialResults.map(
+      ({ side, trialIndex, orderIndex, passed, reason, workspace }) => ({
+        side,
+        trialIndex,
+        orderIndex,
+        passed,
+        reason,
+        workspace,
+      }),
+    ),
   };
   writeFileSync(
     join(config.outputDir, "summary.json"),
     JSON.stringify(summary, null, 2) + "\n",
+    { mode: 0o600 },
   );
-
-  console.log(`Composed lifecycle A/B artifacts: ${config.outputDir}`);
-  console.log(
-    `baseline ${baselinePasses}/${config.trials}, candidate ${candidatePasses}/${config.trials}`,
-  );
+  return summary;
 }
 
 async function runLifecycleTrial(
   config: LifecycleComparisonConfig,
+  binary: BinarySnapshot,
   side: ComparisonSide,
   trialIndex: number,
   orderIndex: number,
 ): Promise<LifecycleTrialResult> {
-  const binaryPath = side === "baseline" ? config.baselineBin : config.candidateBin;
+  const binaryHashBefore = createHash("sha256")
+    .update(readFileSync(binary.path))
+    .digest("hex");
+  if (binaryHashBefore !== binary.sha256) {
+    throw new Error(`${side} binary snapshot changed before trial ${trialIndex}`);
+  }
+
   const workspace = join(config.outputDir, `trial-${trialIndex}`, `${orderIndex}-${side}`);
+  const verifierWorkspace = `${workspace}-held-out`;
+  const traceDir = join(config.outputDir, "traces");
+  mkdirSync(traceDir, { recursive: true, mode: 0o700 });
+  chmodSync(traceDir, 0o700);
+  const tracePath = join(traceDir, `trial-${trialIndex}-${orderIndex}-${side}.log`);
+  rmSync(tracePath, { force: true });
   writeLifecycleFixture(workspace, "flawed");
   const preflight = await runBunTestFile(workspace, "pool.test.ts");
   if (preflight.code !== 0) {
@@ -459,11 +663,11 @@ async function runLifecycleTrial(
     throw new Error("held-out verifier became visible before the fx run");
   }
 
-  const home = createEvalHome();
+  const home = createEvalHome(config.effort);
   let fx: ProcessResult;
   try {
     fx = await runProcess(
-      binaryPath,
+      binary.path,
       [
         "ask",
         "--auto",
@@ -475,12 +679,18 @@ async function runLifecycleTrial(
       ],
       {
         cwd: workspace,
-        timeoutMs: config.timeoutMs + 10_000,
+        timeoutMs: config.timeoutMs + PROCESS_TIMEOUT_GRACE_MS,
         env: {
           ...process.env,
           HOME: home,
           NO_COLOR: "1",
+          FX_AUTO_UPGRADE: "0",
+          FX_MAX_AGENT_STEPS: "100",
           FX_MODEL: config.model,
+          FX_PERMISSION_MODE: "auto",
+          FX_SKIP_ONBOARDING: "1",
+          FX_TRACE_LOG: tracePath,
+          FX_TRACE_SCOPES: "agent",
         },
       },
     );
@@ -493,19 +703,52 @@ async function runLifecycleTrial(
     fxJson = JSON.parse(fx.stdout.trim()) as HeadlessResult;
   } catch {}
 
-  const heldOutPath = join(workspace, "held-out-lifecycle.test.ts");
-  const agentCreatedHeldOut = existsSync(heldOutPath);
+  const agentHeldOutPath = join(workspace, "held-out-lifecycle.test.ts");
+  const agentCreatedHeldOut = existsSync(agentHeldOutPath);
   if (agentCreatedHeldOut) {
-    rmSync(heldOutPath, { recursive: true, force: true });
+    rmSync(agentHeldOutPath, { recursive: true, force: true });
   }
-  writeHeldOutLifecycleVerifier(workspace);
   const visible = await runBunTestFile(workspace, "pool.test.ts");
-  const heldOut = await runBunTestFile(workspace, "held-out-lifecycle.test.ts");
+  let heldOut: ProcessResult;
+  try {
+    prepareHeldOutLifecycleWorkspace(workspace, verifierWorkspace);
+    heldOut = await runBunTestFile(
+      verifierWorkspace,
+      "held-out-lifecycle.test.ts",
+    );
+  } catch (error) {
+    heldOut = {
+      stdout: "",
+      stderr: error instanceof Error ? error.message : String(error),
+      code: null,
+      signal: null,
+      timedOut: false,
+    };
+  }
+
+  let trace = "";
+  if (existsSync(tracePath)) {
+    trace = redactKnownSecrets(readFileSync(tracePath, "utf8"));
+    writeFileSync(tracePath, trace);
+    chmodSync(tracePath, 0o600);
+  }
+  const verificationInjected = trace.includes(FINAL_VERIFICATION_TRACE_EVENT);
+  const binaryHashAfter = createHash("sha256")
+    .update(readFileSync(binary.path))
+    .digest("hex");
   const reasons: string[] = [];
   if (agentCreatedHeldOut) reasons.push("agent created the reserved held-out verifier path");
+  if (binaryHashAfter !== binary.sha256) reasons.push("binary snapshot changed during trial");
+  if (side === "candidate" && !verificationInjected) {
+    reasons.push("candidate did not inject final verification after mutation");
+  }
+  if (side === "baseline" && verificationInjected) {
+    reasons.push("baseline unexpectedly injected final verification");
+  }
   if (fx.timedOut) reasons.push("fx process timed out");
   if (fx.code !== 0) reasons.push(`fx process exited ${fx.code}`);
   if (!fxJson) reasons.push("fx JSON output could not be parsed");
+  if (fxJson?.error) reasons.push(`fx reported error ${fxJson.error}`);
   if (fxJson && fxJson.exit_code !== 0) {
     reasons.push(`fx reported exit_code ${fxJson.exit_code}`);
   }
@@ -519,10 +762,12 @@ async function runLifecycleTrial(
     side,
     trialIndex,
     orderIndex,
-    binaryPath,
-    binarySha256: createHash("sha256").update(readFileSync(binaryPath)).digest("hex"),
-    versionOutput: await versionFor(binaryPath),
+    binaryPath: binary.path,
+    binarySha256: binary.sha256,
+    versionOutput: binary.versionOutput,
     workspace,
+    verifierWorkspace,
+    verificationInjected,
     preflight,
     fx,
     fxJson,
@@ -531,19 +776,23 @@ async function runLifecycleTrial(
     passed: reasons.length === 0,
     reason: reasons.length === 0 ? "passed" : reasons.join("; "),
   };
-  writeFileSync(
-    join(workspace, "trial-result.json"),
+  const artifact = redactKnownSecrets(
     JSON.stringify(result, null, 2) + "\n",
   );
+  writeFileSync(join(workspace, "trial-result.json"), artifact, {
+    mode: 0o600,
+  });
   return result;
 }
 
-function createEvalHome(): string {
+function createEvalHome(effort: string): string {
   const home = mkdtempSync(join(tmpdir(), "fx-composed-lifecycle-home-"));
   mkdirSync(join(home, ".fx"), { recursive: true, mode: 0o700 });
   writeFileSync(
     join(home, ".fx", "settings.json"),
     JSON.stringify({
+      effort,
+      fast_mode: false,
       permission_mode: "auto",
       permission: {
         bash: "allow",
@@ -560,11 +809,10 @@ function createEvalHome(): string {
 async function versionFor(binaryPath: string): Promise<string> {
   const result = await runProcess(binaryPath, ["--version"], {
     cwd: process.cwd(),
-    timeoutMs: 15_000,
+    timeoutMs: VERSION_TIMEOUT_MS,
   });
   return (result.stdout || result.stderr).trim() || `exit ${result.code}`;
 }
-
 
 async function runProcess(
   command: string,
