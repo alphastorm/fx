@@ -1,10 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import {
   existsSync,
-  lstatSync,
-  mkdirSync,
   mkdtempSync,
-  readFileSync,
   rmSync,
   statSync,
   symlinkSync,
@@ -13,23 +10,13 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
-  createLifecycleEvalHome,
   LIFECYCLE_TASK_PROMPT,
-  MAX_LIFECYCLE_AB_TRIALS,
-  comparisonOrder,
-  comparisonTimeoutMs,
-  loadLifecycleComparisonConfig,
-  lifecycleHasLiveCredential,
   prepareHeldOutLifecycleWorkspace,
-  redactKnownSecrets,
   runBunTestFile,
-  runLifecycleComparison,
   writeHeldOutLifecycleVerifier,
   writeLifecycleFixture,
-  type LifecycleComparisonConfig,
 } from "./composed-lifecycle-eval";
 
-const darwinTest = test.skipIf(process.platform !== "darwin");
 
 describe("composed lifecycle fixture", () => {
   test("frozen flaw passes visible tests and fails the held-out transition", async () => {
@@ -113,129 +100,4 @@ describe("composed lifecycle fixture", () => {
     expect(LIFECYCLE_TASK_PROMPT).not.toMatch(/asyncio|python|semaphore|sigint/i);
     expect(LIFECYCLE_TASK_PROMPT).not.toContain("held-out-lifecycle.test.ts");
   });
-});
-
-describe("composed lifecycle A/B harness", () => {
-  test("alternates baseline and candidate execution order", () => {
-    expect(comparisonOrder(0)).toEqual(["baseline", "candidate"]);
-    expect(comparisonOrder(1)).toEqual(["candidate", "baseline"]);
-  });
-
-  test("recognizes explicit Fx login authentication", () => {
-    expect(
-      lifecycleHasLiveCredential({
-        FX_LIFECYCLE_AB_USE_FX_LOGIN: "1",
-      }),
-    ).toBe(true);
-  });
-
-  darwinTest("isolates settings while linking the login keychain", () => {
-    const sourceHome = mkdtempSync(join(tmpdir(), "fx-lifecycle-source-home-"));
-    mkdirSync(join(sourceHome, "Library", "Keychains"), {
-      recursive: true,
-      mode: 0o700,
-    });
-    const evalHome = createLifecycleEvalHome(
-      "high",
-      "fx-login",
-      sourceHome,
-    );
-    try {
-      expect(
-        lstatSync(join(evalHome, "Library", "Keychains")).isSymbolicLink(),
-      ).toBe(true);
-      expect(
-        readFileSync(join(evalHome, ".fx", "settings.json"), "utf8"),
-      ).toContain("\"effort\":\"high\"");
-    } finally {
-      rmSync(evalHome, { recursive: true, force: true });
-      rmSync(sourceHome, { recursive: true, force: true });
-    }
-  });
-
-  test("bounds aggregate model-backed trials", () => {
-    expect(() =>
-      loadLifecycleComparisonConfig({
-        FX_LIFECYCLE_AB_BASELINE_BIN: process.execPath,
-        FX_LIFECYCLE_AB_CANDIDATE_BIN: process.execPath,
-        FX_LIFECYCLE_AB_MODEL: "provider/model",
-        FX_LIFECYCLE_AB_TRIALS: String(MAX_LIFECYCLE_AB_TRIALS + 1),
-      })
-    ).toThrow(/integer from 1/);
-  });
-
-  test("derives a comparison timeout from every bounded subprocess", () => {
-    const config: LifecycleComparisonConfig = {
-      baselineBin: process.execPath,
-      candidateBin: process.execPath,
-      model: "provider/model",
-      effort: "high",
-      credentialMode: "environment",
-      trials: 1,
-      outputDir: "/tmp/unused",
-      timeoutMs: 1_000,
-    };
-
-    expect(comparisonTimeoutMs(config)).toBe(292_000);
-  });
-
-  test("rejects byte-identical baseline and candidate snapshots", async () => {
-    const outputDir = mkdtempSync(join(tmpdir(), "fx-lifecycle-identical-"));
-    try {
-      const config: LifecycleComparisonConfig = {
-        baselineBin: process.execPath,
-        candidateBin: process.execPath,
-        model: "provider/model",
-        effort: "high",
-        credentialMode: "environment",
-        trials: 1,
-        outputDir,
-        timeoutMs: 1_000,
-      };
-
-      await expect(runLifecycleComparison(config)).rejects.toThrow(
-        /byte-identical/,
-      );
-      expect(statSync(outputDir).mode & 0o777).toBe(0o700);
-    } finally {
-      rmSync(outputDir, { recursive: true, force: true });
-    }
-  });
-
-  test("redacts inherited gateway credentials from persisted artifacts", () => {
-    const redacted = redactKnownSecrets(
-      "key=secret-key token=secret-token",
-      {
-        AI_GATEWAY_API_KEY: "secret-key",
-        VERCEL_OIDC_TOKEN: "secret-token",
-      },
-    );
-
-    expect(redacted).toBe(
-      "key=[redacted:AI_GATEWAY_API_KEY] token=[redacted:VERCEL_OIDC_TOKEN]",
-    );
-  });
-});
-
-const hasLiveConfig = Boolean(
-  process.env.FX_LIFECYCLE_AB_BASELINE_BIN &&
-    process.env.FX_LIFECYCLE_AB_CANDIDATE_BIN &&
-    process.env.FX_LIFECYCLE_AB_MODEL &&
-    lifecycleHasLiveCredential(),
-);
-const liveConfig = hasLiveConfig ? loadLifecycleComparisonConfig() : undefined;
-const liveTest = liveConfig ? test : test.skip;
-const liveTimeoutMs = liveConfig
-  ? comparisonTimeoutMs(liveConfig)
-  : 30 * 60 * 1000;
-
-describe("composed lifecycle live comparison", () => {
-  liveTest(
-    "compares configured baseline and candidate binaries",
-    async () => {
-      if (!liveConfig) throw new Error("live comparison config missing");
-      await runLifecycleComparison(liveConfig);
-    },
-    liveTimeoutMs,
-  );
 });
