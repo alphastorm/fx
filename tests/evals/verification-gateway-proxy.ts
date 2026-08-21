@@ -287,6 +287,17 @@ interface RequestInspection {
   verification_reminder_count: number;
 }
 
+function countStringOccurrences(value: string, needle: string): number {
+  let count = 0;
+  let offset = 0;
+  while (true) {
+    const found = value.indexOf(needle, offset);
+    if (found < 0) return count;
+    count += 1;
+    offset = found + needle.length;
+  }
+}
+
 function inspectRequest(request: Request, body: Uint8Array): RequestInspection | null {
   let parsed: unknown;
   try {
@@ -313,8 +324,8 @@ function inspectRequest(request: Request, body: Uint8Array): RequestInspection |
     const value = pending.pop();
     visited += 1;
     if (visited > 200_000) return null;
-    if (value === VERIFICATION_REMINDER) {
-      verification_reminder_count += 1;
+    if (typeof value === "string") {
+      verification_reminder_count += countStringOccurrences(value, VERIFICATION_REMINDER);
     } else if (Array.isArray(value)) {
       pending.push(...value);
     } else if (value && typeof value === "object") {

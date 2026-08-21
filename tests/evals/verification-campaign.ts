@@ -800,7 +800,6 @@ export interface FreezeManifestInput {
   candidate: FrozenBinary;
   trials_per_case?: number;
   coordinate_timeout_ms?: number;
-  infrastructure_retry_limit?: number;
   agent_step_limit?: number;
 }
 
@@ -856,7 +855,7 @@ export function buildFrozenManifest(input: FreezeManifestInput): FrozenCampaignM
     },
     execution: {
       coordinate_timeout_ms: input.coordinate_timeout_ms ?? 300_000,
-      infrastructure_retry_limit: input.infrastructure_retry_limit ?? 1,
+      infrastructure_retry_limit: 0,
       agent_step_limit: input.agent_step_limit ?? 20,
     },
     binaries: { baseline: input.baseline, candidate: input.candidate },
@@ -888,6 +887,9 @@ export function validateFrozenManifest(manifest: FrozenCampaignManifest): void {
     throw new Error(
       `${manifest.phase} campaign requires exactly ${expectedTrials} trials per case`,
     );
+  }
+  if (manifest.execution.infrastructure_retry_limit !== 0) {
+    throw new Error("campaign coordinates do not permit infrastructure retries");
   }
   const expectedReminder = sha256Text(UPFRONT_VERIFICATION_INSTRUCTION);
   if (manifest.reminder_sha256 !== expectedReminder) {

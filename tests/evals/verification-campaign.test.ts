@@ -197,6 +197,7 @@ describe("frozen manifest", () => {
     });
 
     expect(manifest.trials_per_case).toBe(FINAL_TRIALS_PER_CASE);
+    expect(manifest.execution.infrastructure_retry_limit).toBe(0);
     expect(manifest.coordinates).toHaveLength(160);
     for (const testCase of FINAL_CASES) {
       const coordinates = manifest.coordinates.filter(
@@ -237,6 +238,13 @@ describe("frozen manifest", () => {
     resign(trials);
     expect(() => validateFrozenManifest(trials)).toThrow(
       "pilot campaign requires exactly 2 trials per case",
+    );
+
+    const retries = pilotManifest();
+    retries.execution.infrastructure_retry_limit = 1;
+    resign(retries);
+    expect(() => validateFrozenManifest(retries)).toThrow(
+      "campaign coordinates do not permit infrastructure retries",
     );
 
     const reminder = pilotManifest();

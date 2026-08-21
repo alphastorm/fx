@@ -144,7 +144,6 @@ export interface CoordinateResult {
   workspace_unchanged: boolean | null;
   output_contract_passed: boolean | null;
   passed: boolean;
-  infrastructure_retryable: boolean;
 }
 interface HostGatewayCredential {
   token: string;
@@ -895,7 +894,10 @@ export function classifyCoordinateValidity(input: ValidityInput): CoordinateVali
   }
   const mutated = successfulBuiltinMutation(input.headless);
   const count = hostReminderCount(input.host_events);
-  const expectedReminder = input.coordinate.arm === "candidate" && mutated ? 1 : 0;
+  const expectedReminder = Number(
+    input.coordinate.arm === "instructed" ||
+      (input.coordinate.arm === "candidate" && mutated),
+  );
   if (count !== expectedReminder) reasons.push("reminder_count_mismatch");
   const commands = verificationCommands(input.headless);
   return {
@@ -908,20 +910,6 @@ export function classifyCoordinateValidity(input: ValidityInput): CoordinateVali
     truthful_report: reportIsTruthful(input.headless, commands),
     tokens: sumProxyUsage(input.host_events),
   };
-}
-export function retryableInfrastructure(reasons: readonly string[]): boolean {
-  if (reasons.length === 0) return false;
-  const retryable = new Set([
-    "docker_timed_out",
-    "host_proxy_no_requests",
-    "host_proxy_request_failed",
-    "gateway_stream_invalid",
-    "relay_proxy_no_requests",
-    "relay_proxy_request_failed",
-    "pinned_catalog_not_observed",
-    "missing_login_shell",
-  ]);
-  return reasons.every((reason) => retryable.has(reason));
 }
 
 function snapshotEqual(left: SnapshotManifest, right: SnapshotManifest): boolean {
@@ -1160,7 +1148,6 @@ async function runCoordinateAttempt(input: {
     workspace_unchanged: workspaceUnchanged,
     output_contract_passed: outputPassed,
     passed,
-    infrastructure_retryable: !validity.valid && retryableInfrastructure(validity.reasons),
   };
   writeAtomic(join(attemptDirectory, "result.json"), canonicalJson(result));
     return result;
@@ -1198,19 +1185,14 @@ async function runCampaign(
         }
         continue;
       }
-      let result: CoordinateResult | null = null;
-      for (let attempt = 0; attempt <= manifest.execution.infrastructure_retry_limit; attempt += 1) {
-        result = await runCoordinateAttempt({
-          manifest,
-          coordinate,
-          attempt,
-          output_directory: outputDirectory,
-          host_proxy: hostProxy,
-          allowed_nonces: allowedNonces,
-        });
-        if (result.validity.valid || !result.infrastructure_retryable) break;
-      }
-      if (!result) throw new Error("coordinate produced no result");
+      const result = await runCoordinateAttempt({
+        manifest,
+        coordinate,
+        attempt: 0,
+        output_directory: outputDirectory,
+        host_proxy: hostProxy,
+        allowed_nonces: allowedNonces,
+      });
       writeAtomic(receiptPath, canonicalJson(result));
       process.stdout.write(
         `${coordinate.case_id} trial=${coordinate.trial_index} arm=${coordinate.arm} valid=${result.validity.valid} pass=${result.passed}\n`,
@@ -1767,7 +1749,6 @@ async function runDockerSmoke(args: readonly string[]): Promise<void> {
     candidate: await frozenBinary(image, candidatePath, "smoke-candidate"),
     trials_per_case: 1,
     coordinate_timeout_ms: 60_000,
-    infrastructure_retry_limit: 0,
     agent_step_limit: 6,
   });
   mkdirSync(output, { recursive: true, mode: 0o700 });

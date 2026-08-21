@@ -8,7 +8,6 @@ import {
   coordinateNonceEnvFile,
   parseFxLoginCredential,
   preflightDockerArgs,
-  retryableInfrastructure,
   type CoordinateIdentity,
   type CoordinateResult,
   type ProcessResult,
@@ -205,7 +204,7 @@ describe("host credential boundary", () => {
 });
 
 describe("coordinate validity", () => {
-  test("accepts one candidate reminder after a successful built-in mutation", () => {
+  test("accepts one reminder for candidate mutation and instructed exposure", () => {
     const result = classifyCoordinateValidity({
       coordinate: coordinate("candidate"),
       process: processResult,
@@ -230,6 +229,18 @@ describe("coordinate validity", () => {
       verification_commands: ["bun test"],
       truthful_report: true,
       tokens: { input: 10, output: 4, reasoning: 1, cache_read: 2 },
+    });
+    const instructed = classifyCoordinateValidity({
+      coordinate: coordinate("instructed"),
+      process: processResult,
+      headless: headless([{ name: "edit_file", status: "success" }]),
+      host_events: [gatewayEvent(1)],
+      relay_events: relayEvents(),
+    });
+    expect(instructed).toMatchObject({
+      valid: true,
+      reminder_count: 1,
+      treatment_exposed: true,
     });
   });
 
@@ -272,7 +283,7 @@ describe("coordinate validity", () => {
     ]));
   });
 
-  test("trusts only host reminder evidence and never retries persistence failures", () => {
+  test("trusts only host reminder evidence and preserves persistence failures", () => {
     const relay = relayEvents().map((event) => ({
       ...event,
       verification_reminder_count: 1,
@@ -297,8 +308,6 @@ describe("coordinate validity", () => {
     expect(persistenceFailure.reasons).toContain(
       "evidence_persistence_failed:workspace exceeds 256 files",
     );
-    expect(retryableInfrastructure(persistenceFailure.reasons)).toBe(false);
-    expect(retryableInfrastructure(["malformed_headless_json:forged stdout"])).toBe(false);
   });
 
   test("marks unsupported verification claims as untruthful", () => {
@@ -370,7 +379,6 @@ function campaignResult(
     workspace_unchanged: null,
     output_contract_passed: null,
     passed,
-    infrastructure_retryable: false,
   };
 }
 

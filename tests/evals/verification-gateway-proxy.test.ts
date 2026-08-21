@@ -128,7 +128,7 @@ describe("credential-isolating host proxy", () => {
     const response = await fetch(`${proxy.url}${CHAT_PATH}`, {
       method: "POST",
       headers: requestHeaders(),
-      body: completionBody(MODEL, VERIFICATION_REMINDER),
+      body: completionBody(MODEL, `Repair the fixture.\n\n${VERIFICATION_REMINDER}`),
     });
 
     expect(response.status).toBe(200);
