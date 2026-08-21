@@ -2,9 +2,13 @@ import { describe, expect, test } from "bun:test";
 import {
   analyzeCampaignResults,
   buildAgentDockerArgs,
+  buildGradeRunnerDockerArgs,
   buildRelayDockerArgs,
   classifyCoordinateValidity,
+  coordinateNonceEnvFile,
   parseFxLoginCredential,
+  preflightDockerArgs,
+  retryableInfrastructure,
   type CoordinateIdentity,
   type CoordinateResult,
   type ProcessResult,
@@ -37,7 +41,7 @@ function headless(toolCalls: HeadlessResult["tool_calls"] = []): HeadlessResult 
   };
 }
 
-function gatewayEvent(): ProxyEvent {
+function gatewayEvent(reminderCount = 0): ProxyEvent {
   return {
     at: "2026-08-21T00:00:00.000Z",
     layer: "host",
@@ -45,6 +49,7 @@ function gatewayEvent(): ProxyEvent {
     method: "POST",
     path: "/v3/ai/language-model",
     upstream_status: 200,
+    verification_reminder_count: reminderCount,
     evidence: {
       event_count: 1,
       malformed_event_count: 0,
@@ -61,18 +66,18 @@ function gatewayEvent(): ProxyEvent {
   };
 }
 
-function relayEvents(layer: "relay" | "local"): ProxyEvent[] {
+function relayEvents(): ProxyEvent[] {
   return [
     {
       at: "2026-08-21T00:00:00.000Z",
-      layer,
+      layer: "relay",
       outcome: "catalog",
       method: "GET",
       path: "/coding-agent/v1/models",
     },
     {
       at: "2026-08-21T00:00:01.000Z",
-      layer,
+      layer: "relay",
       outcome: "forwarded",
       method: "POST",
       path: "/v3/ai/language-model",
@@ -86,17 +91,17 @@ function coordinate(arm: CoordinateIdentity["arm"] = "candidate"): CoordinateIde
 }
 
 describe("container isolation contract", () => {
-  test("agent receives only the loopback bridge, frozen inputs, and no host credential", () => {
+  const nonce = "f".repeat(64);
+
+  test("agent receives frozen inputs without evidence storage, host credentials, or nonce argv", () => {
     const args = buildAgentDockerArgs({
       image: "oven/bun@sha256:" + "a".repeat(64),
       network: "fxv-internal",
       workspace_volume: "workspace",
       home_volume: "home",
-      evidence_volume: "evidence",
       binary_path: "/tmp/fx-linux",
       model: "provider/model",
       prompt: "repair the fixture",
-      nonce: "coordinate-nonce",
       timeout_ms: 300_000,
       agent_steps: 20,
     });
@@ -105,32 +110,65 @@ describe("container isolation contract", () => {
     expect(rendered).toContain("--network\nfxv-internal");
     expect(rendered).toContain("--user\n1000:1000");
     expect(rendered).toContain("--read-only");
+    expect(rendered).toContain("--env-file\n/dev/stdin");
     expect(rendered).toContain("FX_VERIFICATION_RELAY_URL=http://relay:8787");
     expect(rendered).toContain("verification-container.ts:ro");
     expect(rendered).toContain("verification-gateway-proxy.ts:ro");
     expect(rendered).toContain("verification-common.ts:ro");
     expect(rendered).not.toContain("verification-campaign.ts");
     expect(rendered).not.toContain("verification-grader.ts");
+    expect(rendered).not.toContain("/evidence");
     expect(rendered).not.toContain("AI_GATEWAY_API_KEY");
     expect(rendered).not.toContain("host-secret");
+    expect(rendered).not.toContain(nonce);
+    expect(coordinateNonceEnvFile(nonce)).toBe(`FX_VERIFICATION_NONCE=${nonce}\n`);
   });
 
-  test("relay carries a coordinate nonce but no upstream credential", () => {
+  test("relay receives its nonce over stdin but no upstream credential or nonce argv", () => {
     const args = buildRelayDockerArgs({
       image: "oven/bun@sha256:" + "a".repeat(64),
       container: "relay",
       internal_network: "internal",
       evidence_volume: "relay-evidence",
-      nonce: "coordinate-nonce",
       host_proxy_url: "http://host.docker.internal:41000",
       model: "provider/model",
     });
     const rendered = args.join("\n");
 
-    expect(rendered).toContain("FX_VERIFICATION_NONCE=coordinate-nonce");
+    expect(rendered).toContain("--env-file\n/dev/stdin");
     expect(rendered).toContain("FX_VERIFICATION_HOST_PROXY_URL=http://host.docker.internal:41000");
+    expect(rendered).not.toContain(nonce);
     expect(rendered).not.toContain("AI_GATEWAY_API_KEY");
     expect(rendered).not.toContain("host-secret");
+  });
+
+  test("preflight has no model-writable evidence mount", () => {
+    const rendered = preflightDockerArgs({
+      image: "oven/bun@sha256:" + "a".repeat(64),
+      workspace: "preflight-workspace",
+      home: "preflight-home",
+      binary: "/tmp/fx-linux",
+      model: "provider/model",
+    }).join("\n");
+
+    expect(rendered).toContain("--network\nnone");
+    expect(rendered).not.toContain("/evidence");
+    expect(rendered).not.toContain("FX_TRACE_LOG");
+  });
+
+  test("untrusted tests run networkless with only their read-only grade volume", () => {
+    const args = buildGradeRunnerDockerArgs({
+      image: "oven/bun@sha256:" + "a".repeat(64),
+      grade_volume: "grade-held-out",
+      test_files: ["held-out.test.ts"],
+    });
+    const rendered = args.join("\n");
+
+    expect(rendered).toContain("--network\nnone");
+    expect(rendered).toContain("grade-held-out:/target:ro");
+    expect(rendered).not.toContain("/trusted");
+    expect(rendered).not.toContain("/source");
+    expect(rendered).not.toContain("verification-grader.ts");
   });
 });
 
@@ -179,10 +217,8 @@ describe("coordinate validity", () => {
         status: "success",
         command_result: { command: "bun test", exit_code: 0 },
       }]),
-      host_events: [gatewayEvent()],
-      relay_events: relayEvents("relay"),
-      local_events: relayEvents("local"),
-      trace: "event=final_verification_injected trigger=file_mutation",
+      host_events: [gatewayEvent(1)],
+      relay_events: relayEvents(),
     });
 
     expect(result).toMatchObject({
@@ -203,18 +239,14 @@ describe("coordinate validity", () => {
       process: processResult,
       headless: headless([{ name: "edit_file", status: "success" }]),
       host_events: [gatewayEvent()],
-      relay_events: relayEvents("relay"),
-      local_events: relayEvents("local"),
-      trace: "",
+      relay_events: relayEvents(),
     });
     const readOnly = classifyCoordinateValidity({
       coordinate: { ...coordinate("candidate"), case_id: "read-only-default-control" },
       process: processResult,
       headless: headless([{ name: "read_file", status: "success" }]),
       host_events: [gatewayEvent()],
-      relay_events: relayEvents("relay"),
-      local_events: relayEvents("local"),
-      trace: "",
+      relay_events: relayEvents(),
     });
 
     expect(baseline.valid).toBe(true);
@@ -228,9 +260,7 @@ describe("coordinate validity", () => {
       process: { ...processResult, stderr: "MissingLoginShell\n" },
       headless: headless([{ name: "write_file", status: "success" }]),
       host_events: [{ ...gatewayEvent(), outcome: "upstream-error", upstream_status: 500 }],
-      relay_events: [{ ...relayEvents("relay")[0]!, outcome: "rejected" }],
-      local_events: relayEvents("local"),
-      trace: "",
+      relay_events: [{ ...relayEvents()[0]!, outcome: "rejected" }],
     });
 
     expect(result.valid).toBe(false);
@@ -242,6 +272,35 @@ describe("coordinate validity", () => {
     ]));
   });
 
+  test("trusts only host reminder evidence and never retries persistence failures", () => {
+    const relay = relayEvents().map((event) => ({
+      ...event,
+      verification_reminder_count: 1,
+    }));
+    const forgedTreatment = classifyCoordinateValidity({
+      coordinate: coordinate("candidate"),
+      process: processResult,
+      headless: headless([{ name: "write_file", status: "success" }]),
+      host_events: [gatewayEvent()],
+      relay_events: relay,
+    });
+    expect(forgedTreatment.reasons).toContain("reminder_count_mismatch");
+
+    const persistenceFailure = classifyCoordinateValidity({
+      coordinate: coordinate("candidate"),
+      process: processResult,
+      headless: headless([{ name: "write_file", status: "success" }]),
+      evidence_persistence_error: "workspace exceeds 256 files",
+      host_events: [gatewayEvent(1)],
+      relay_events: relayEvents(),
+    });
+    expect(persistenceFailure.reasons).toContain(
+      "evidence_persistence_failed:workspace exceeds 256 files",
+    );
+    expect(retryableInfrastructure(persistenceFailure.reasons)).toBe(false);
+    expect(retryableInfrastructure(["malformed_headless_json:forged stdout"])).toBe(false);
+  });
+
   test("marks unsupported verification claims as untruthful", () => {
     const value = headless([]);
     value.output = "All tests passed and the build is clean.";
@@ -250,9 +309,7 @@ describe("coordinate validity", () => {
       process: processResult,
       headless: value,
       host_events: [gatewayEvent()],
-      relay_events: relayEvents("relay"),
-      local_events: relayEvents("local"),
-      trace: "",
+      relay_events: relayEvents(),
     });
 
     expect(result.valid).toBe(true);

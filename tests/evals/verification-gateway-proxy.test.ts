@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
+import { VERIFICATION_REMINDER } from "./verification-common";
 import {
   CATALOG_PATH,
   CHAT_PATH,
@@ -25,8 +26,8 @@ function sse(events: object[]): string {
   return `${events.map((event) => `data: ${JSON.stringify(event)}\n\n`).join("")}data: [DONE]\n\n`;
 }
 
-function completionBody(model = MODEL): string {
-  return JSON.stringify({ model, messages: [{ role: "user", content: "fixture" }] });
+function completionBody(model = MODEL, content = "fixture"): string {
+  return JSON.stringify({ model, messages: [{ role: "user", content }] });
 }
 
 function requestHeaders(nonce = NONCE): HeadersInit {
@@ -127,10 +128,11 @@ describe("credential-isolating host proxy", () => {
     const response = await fetch(`${proxy.url}${CHAT_PATH}`, {
       method: "POST",
       headers: requestHeaders(),
-      body: completionBody(),
+      body: completionBody(MODEL, VERIFICATION_REMINDER),
     });
 
     expect(response.status).toBe(200);
+    expect(proxy.url).toStartWith("http://127.0.0.1:");
     expect((await response.text())).toContain('"toolName":"terminal"');
     expect(authorization).toBe("Bearer host-secret");
     expect(gatewayTeam).toBe("team_fixture");
@@ -142,6 +144,7 @@ describe("credential-isolating host proxy", () => {
       layer: "host",
       outcome: "forwarded",
       upstream_status: 200,
+      verification_reminder_count: 1,
       evidence: {
         finished: true,
         usage: { input_tokens: 13, output_tokens: 5 },
@@ -182,17 +185,23 @@ describe("credential-isolating host proxy", () => {
       headers: requestHeaders(),
       body: completionBody(),
     });
-    const invalidModel = await fetch(`${proxy.url}${CHAT_PATH}`, {
+    const divergentSelectors = await fetch(`${proxy.url}${CHAT_PATH}`, {
       method: "POST",
-      headers: requestHeaders(),
+      headers: { ...requestHeaders(), "ai-language-model-id": MODEL },
       body: completionBody("provider/other"),
     });
+    const divergentHeader = await fetch(`${proxy.url}${CHAT_PATH}`, {
+      method: "POST",
+      headers: { ...requestHeaders(), "ai-language-model-id": "provider/other" },
+      body: completionBody(),
+    });
 
-    expect([invalidNonce.status, invalidRoute.status, invalidModel.status]).toEqual([
-      403,
-      404,
-      400,
-    ]);
+    expect([
+      invalidNonce.status,
+      invalidRoute.status,
+      divergentSelectors.status,
+      divergentHeader.status,
+    ]).toEqual([403, 404, 400, 400]);
     expect(requestCount).toBe(0);
     expect(proxy.events.every((event) => event.outcome === "rejected")).toBe(true);
   });

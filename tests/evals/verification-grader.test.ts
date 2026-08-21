@@ -13,6 +13,7 @@ import { caseById } from "./verification-campaign";
 import {
   discoverSubmittedTests,
   gradeWorkspace,
+  gradeResultFromProcess,
   prepareGradeWorkspace,
   readRegularFileNoFollow,
   seedFixture,
@@ -155,6 +156,47 @@ describe("grade workspace preparation", () => {
     expect(correctResult.status, `${correctResult.stdout}\n${correctResult.stderr}`).toBe(
       "passed",
     );
+  });
+
+  test("exit zero without a completed Bun test summary is invalid", async () => {
+    const root = temporaryDirectory();
+    const source = join(root, "source");
+    const target = join(root, "target");
+    const testCase = caseById("pilot-temp-cleanup");
+    seedFixture(testCase, source);
+    overwrite(
+      source,
+      "with-temp.ts",
+      "process.exit(0);\nexport async function withTemp<T>(_path: string, _run: () => Promise<T>): Promise<T> { throw new Error(\"unreachable\"); }\n",
+    );
+
+    const result = await gradeWorkspace(
+      testCase,
+      "held-out",
+      source,
+      target,
+    );
+
+    expect(result.exit_code).toBe(0);
+    expect(result.status).toBe("invalid");
+    expect(result.test_summary).toBeNull();
+    expect(result.error).toBe("grader emitted no complete Bun test summary");
+  });
+
+  test("grade result rejects synthetic exit-zero output without JUnit completion", () => {
+    const result = gradeResultFromProcess({
+      suite: "held-out",
+      test_files: ["held-out.test.ts"],
+      copied_implementation_files: [],
+      copied_submitted_tests: [],
+    }, {
+      exit_code: 0,
+      signal: null,
+      timed_out: false,
+      stdout: "",
+      stderr: "",
+    });
+    expect(result.status).toBe("invalid");
   });
 });
 

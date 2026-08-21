@@ -19,6 +19,7 @@ import {
 } from "./agent-quality-ab";
 import {
   FINAL_TRIALS_PER_CASE,
+  PILOT_TRIALS_PER_CASE,
   buildFrozenManifest,
   canonicalJson,
   caseById,
@@ -34,7 +35,12 @@ import {
   type PilotArm,
   type VerificationCase,
 } from "./verification-campaign";
-import type { GradeResult, SnapshotManifest } from "./verification-grader";
+import {
+  gradeResultFromProcess,
+  type GradeResult,
+  type PreparedGrade,
+  type SnapshotManifest,
+} from "./verification-grader";
 import {
   CHAT_PATH,
   CATALOG_PATH,
@@ -151,6 +157,7 @@ interface CommandOptions {
   env?: NodeJS.ProcessEnv;
   timeout_ms?: number;
   max_output_bytes?: number;
+  stdin?: string;
 }
 
 async function runProcess(
@@ -163,7 +170,7 @@ async function runProcess(
     const child = nodeSpawn(command, [...args], {
       cwd: options.cwd,
       env: options.env,
-      stdio: ["ignore", "pipe", "pipe"],
+      stdio: [options.stdin === undefined ? "ignore" : "pipe", "pipe", "pipe"],
     });
     const stdout: Buffer[] = [];
     const stderr: Buffer[] = [];
@@ -180,8 +187,9 @@ async function runProcess(
       }
       target.push(chunk);
     };
-    child.stdout.on("data", (chunk: Buffer) => append(stdout, chunk));
-    child.stderr.on("data", (chunk: Buffer) => append(stderr, chunk));
+    child.stdout!.on("data", (chunk: Buffer) => append(stdout, chunk));
+    child.stderr!.on("data", (chunk: Buffer) => append(stderr, chunk));
+    if (options.stdin !== undefined) child.stdin?.end(options.stdin);
     const timer = options.timeout_ms
       ? setTimeout(() => {
         timedOut = true;
@@ -293,8 +301,9 @@ async function resolveHostGatewayCredential(): Promise<HostGatewayCredential> {
 async function docker(
   args: readonly string[],
   timeoutMs = 120_000,
+  stdin?: string,
 ): Promise<ProcessResult> {
-  return await runProcess("docker", args, { timeout_ms: timeoutMs });
+  return await runProcess("docker", args, { timeout_ms: timeoutMs, stdin });
 }
 
 function writeAtomic(path: string, content: string): void {
@@ -521,6 +530,56 @@ async function seedWorkspace(
   return JSON.parse(result.stdout) as SnapshotManifest;
 }
 
+function invalidGradeResult(
+  suite: "visible" | "held-out" | "submitted",
+  process: ProcessResult,
+  error: string,
+): GradeResult {
+  return {
+    suite,
+    test_files: [],
+    copied_implementation_files: [],
+    copied_submitted_tests: [],
+    status: "invalid",
+    exit_code: process.code,
+    signal: process.signal,
+    timed_out: process.timed_out,
+    stdout: process.stdout,
+    stderr: process.stderr,
+    test_summary: null,
+    error,
+  };
+}
+
+export function buildGradeRunnerDockerArgs(input: {
+  image: string;
+  grade_volume: string;
+  test_files: readonly string[];
+}): string[] {
+  for (const path of input.test_files) {
+    const parts = path.split("/");
+    if (!path || path.startsWith("/") || parts.some((part) => !part || part === "." || part === "..")) {
+      throw new Error(`unsafe grader test path: ${JSON.stringify(path)}`);
+    }
+  }
+  return [
+    "run",
+    "--rm",
+    ...hardenedContainerArgs("none"),
+    "-v",
+    `${input.grade_volume}:/target:ro`,
+    "-w",
+    "/target",
+    input.image,
+    "bun",
+    "test",
+    ...input.test_files,
+    "--reporter=junit",
+    "--reporter-outfile",
+    "/dev/stdout",
+  ];
+}
+
 async function gradeNamedVolume(
   resources: DockerResources,
   sourceVolume: string,
@@ -530,7 +589,8 @@ async function gradeNamedVolume(
   artifactDirectory: string,
 ): Promise<GradeResult> {
   await resources.createVolume(gradeVolume);
-  const raw = await docker([
+  mkdirSync(artifactDirectory, { recursive: true, mode: 0o700 });
+  const preparation = await docker([
     "run",
     "--rm",
     ...hardenedContainerArgs("none"),
@@ -542,7 +602,7 @@ async function gradeNamedVolume(
     resources.image,
     "bun",
     GRADER_ENTRY.replace(EVAL_DIRECTORY, "/trusted"),
-    "grade",
+    "prepare",
     "--case",
     testCase.id,
     "--suite",
@@ -552,10 +612,57 @@ async function gradeNamedVolume(
     "--target",
     "/target",
   ], 120_000);
-  mkdirSync(artifactDirectory, { recursive: true, mode: 0o700 });
-  writeAtomic(join(artifactDirectory, "stdout.json"), raw.stdout);
-  writeAtomic(join(artifactDirectory, "stderr.txt"), raw.stderr);
-  writeAtomic(join(artifactDirectory, "process.json"), canonicalJson(raw));
+  writeAtomic(join(artifactDirectory, "prepare-stdout.json"), preparation.stdout);
+  writeAtomic(join(artifactDirectory, "prepare-stderr.txt"), preparation.stderr);
+  writeAtomic(join(artifactDirectory, "prepare-process.json"), canonicalJson(preparation));
+
+  let result: GradeResult;
+  try {
+    if (preparation.code !== 0 || preparation.timed_out) {
+      throw new Error("trusted grade preparation failed");
+    }
+    const prepared = JSON.parse(preparation.stdout) as PreparedGrade;
+    if (
+      prepared.suite !== suite ||
+      !Array.isArray(prepared.test_files) ||
+      !Array.isArray(prepared.copied_implementation_files) ||
+      !Array.isArray(prepared.copied_submitted_tests)
+    ) {
+      throw new Error("trusted grade preparation emitted an invalid contract");
+    }
+    if (prepared.test_files.length === 0) {
+      result = gradeResultFromProcess(prepared, {
+        exit_code: null,
+        signal: null,
+        timed_out: false,
+        stdout: "",
+        stderr: "",
+      });
+    } else {
+      const execution = await docker(buildGradeRunnerDockerArgs({
+        image: resources.image,
+        grade_volume: gradeVolume,
+        test_files: prepared.test_files,
+      }), 120_000);
+      writeAtomic(join(artifactDirectory, "runner-stdout.xml"), execution.stdout);
+      writeAtomic(join(artifactDirectory, "runner-stderr.txt"), execution.stderr);
+      writeAtomic(join(artifactDirectory, "runner-process.json"), canonicalJson(execution));
+      result = gradeResultFromProcess(prepared, {
+        exit_code: execution.code,
+        signal: execution.signal,
+        timed_out: execution.timed_out,
+        stdout: execution.stdout,
+        stderr: execution.stderr,
+      });
+    }
+  } catch (error) {
+    result = invalidGradeResult(
+      suite,
+      preparation,
+      error instanceof Error ? error.message : String(error),
+    );
+  }
+
   const snapshotVolume = `${gradeVolume}-snapshot`;
   await snapshotNamedVolume(resources, gradeVolume, snapshotVolume, testCase.id);
   await exportTrustedVolume(
@@ -564,38 +671,15 @@ async function gradeNamedVolume(
     join(artifactDirectory, "workspace"),
     `${gradeVolume}-workspace`,
   );
-  if (raw.code !== 0 && !raw.stdout.trim()) {
-    return {
-      suite,
-      test_files: [],
-      copied_implementation_files: [],
-      copied_submitted_tests: [],
-      status: "invalid",
-      exit_code: raw.code,
-      signal: raw.signal,
-      timed_out: raw.timed_out,
-      stdout: "",
-      stderr: raw.stderr,
-      error: "grader process failed without JSON output",
-    };
+  writeAtomic(join(artifactDirectory, "result.json"), canonicalJson(result));
+  return result;
+}
+
+export function coordinateNonceEnvFile(nonce: string): string {
+  if (!/^[a-f0-9]{64}$/.test(nonce)) {
+    throw new Error("coordinate nonce must be lowercase 64-hex");
   }
-  try {
-    return JSON.parse(raw.stdout) as GradeResult;
-  } catch {
-    return {
-      suite,
-      test_files: [],
-      copied_implementation_files: [],
-      copied_submitted_tests: [],
-      status: "invalid",
-      exit_code: raw.code,
-      signal: raw.signal,
-      timed_out: raw.timed_out,
-      stdout: raw.stdout,
-      stderr: raw.stderr,
-      error: "grader emitted malformed JSON",
-    };
-  }
+  return `FX_VERIFICATION_NONCE=${nonce}\n`;
 }
 
 export interface AgentDockerArgsInput {
@@ -603,11 +687,9 @@ export interface AgentDockerArgsInput {
   network: string;
   workspace_volume: string;
   home_volume: string;
-  evidence_volume: string;
   binary_path: string;
   model: string;
   prompt: string;
-  nonce: string;
   timeout_ms: number;
   agent_steps: number;
 }
@@ -623,8 +705,6 @@ export function buildAgentDockerArgs(input: AgentDockerArgsInput): string[] {
     "-v",
     `${input.home_volume}:/home/bun`,
     "-v",
-    `${input.evidence_volume}:/evidence`,
-    "-v",
     `${input.binary_path}:/opt/fx/fx:ro`,
     "-w",
     "/workspace",
@@ -634,8 +714,8 @@ export function buildAgentDockerArgs(input: AgentDockerArgsInput): string[] {
     "SHELL=/bin/sh",
     "-e",
     `FX_MODEL=${input.model}`,
-    "-e",
-    `FX_VERIFICATION_NONCE=${input.nonce}`,
+    "--env-file",
+    "/dev/stdin",
     "-e",
     "FX_VERIFICATION_RELAY_URL=http://relay:8787",
     "-e",
@@ -656,7 +736,6 @@ export interface RelayDockerArgsInput {
   container: string;
   internal_network: string;
   evidence_volume: string;
-  nonce: string;
   host_proxy_url: string;
   model: string;
 }
@@ -680,8 +759,8 @@ export function buildRelayDockerArgs(input: RelayDockerArgsInput): string[] {
     `${COMMON_ENTRY}:/harness/verification-common.ts:ro`,
     "-v",
     `${input.evidence_volume}:/evidence`,
-    "-e",
-    `FX_VERIFICATION_NONCE=${input.nonce}`,
+    "--env-file",
+    "/dev/stdin",
     "-e",
     `FX_VERIFICATION_HOST_PROXY_URL=${input.host_proxy_url}`,
     "-e",
@@ -721,8 +800,16 @@ function parseJsonLines(path: string): ProxyEvent[] {
     .map((line) => JSON.parse(line) as ProxyEvent);
 }
 
-function reminderCount(trace: string): number {
-  return trace.match(/final_verification_injected/g)?.length ?? 0;
+function hostReminderCount(events: readonly ProxyEvent[]): number {
+  return Math.max(
+    0,
+    ...events.map((event) =>
+      Number.isSafeInteger(event.verification_reminder_count) &&
+        (event.verification_reminder_count ?? -1) >= 0
+        ? event.verification_reminder_count!
+        : 0
+    ),
+  );
 }
 
 function successfulBuiltinMutation(headless: HeadlessResult | null): boolean {
@@ -765,10 +852,9 @@ export interface ValidityInput {
   process: ProcessResult;
   headless: HeadlessResult | null;
   parse_error?: string;
+  evidence_persistence_error?: string;
   host_events: readonly ProxyEvent[];
   relay_events: readonly ProxyEvent[];
-  local_events: readonly ProxyEvent[];
-  trace: string;
 }
 
 export function classifyCoordinateValidity(input: ValidityInput): CoordinateValidity {
@@ -776,10 +862,13 @@ export function classifyCoordinateValidity(input: ValidityInput): CoordinateVali
   if (input.process.timed_out) reasons.push("docker_timed_out");
   if (input.process.code !== 0) reasons.push(`docker_exit_${input.process.code ?? "signal"}`);
   if (input.parse_error) reasons.push(`malformed_headless_json:${input.parse_error}`);
+  if (input.evidence_persistence_error) {
+    reasons.push(`evidence_persistence_failed:${input.evidence_persistence_error}`);
+  }
   if (!input.headless) reasons.push("headless_result_missing");
   if (input.headless?.exit_code !== 0) reasons.push("headless_exit_nonzero");
   if (input.headless?.error) reasons.push("headless_error");
-  if (`${input.process.stdout}\n${input.process.stderr}\n${input.trace}`.includes("MissingLoginShell")) {
+  if (`${input.process.stdout}\n${input.process.stderr}`.includes("MissingLoginShell")) {
     reasons.push("missing_login_shell");
   }
   if (input.host_events.length === 0) reasons.push("host_proxy_no_requests");
@@ -793,17 +882,19 @@ export function classifyCoordinateValidity(input: ValidityInput): CoordinateVali
       break;
     }
   }
-  for (const [layer, events] of [["relay", input.relay_events], ["local", input.local_events]] as const) {
-    if (events.length === 0) reasons.push(`${layer}_proxy_no_requests`);
-    if (events.some((event) => event.outcome === "rejected" || event.outcome === "upstream-error")) {
-      reasons.push(`${layer}_proxy_request_failed`);
-    }
+  if (input.relay_events.length === 0) reasons.push("relay_proxy_no_requests");
+  if (
+    input.relay_events.some((event) =>
+      event.outcome === "rejected" || event.outcome === "upstream-error"
+    )
+  ) {
+    reasons.push("relay_proxy_request_failed");
   }
   if (!input.relay_events.some((event) => event.outcome === "catalog" && event.path === CATALOG_PATH)) {
     reasons.push("pinned_catalog_not_observed");
   }
   const mutated = successfulBuiltinMutation(input.headless);
-  const count = reminderCount(input.trace);
+  const count = hostReminderCount(input.host_events);
   const expectedReminder = input.coordinate.arm === "candidate" && mutated ? 1 : 0;
   if (count !== expectedReminder) reasons.push("reminder_count_mismatch");
   const commands = verificationCommands(input.headless);
@@ -818,8 +909,7 @@ export function classifyCoordinateValidity(input: ValidityInput): CoordinateVali
     tokens: sumProxyUsage(input.host_events),
   };
 }
-
-function retryableInfrastructure(reasons: readonly string[]): boolean {
+export function retryableInfrastructure(reasons: readonly string[]): boolean {
   if (reasons.length === 0) return false;
   const retryable = new Set([
     "docker_timed_out",
@@ -828,13 +918,10 @@ function retryableInfrastructure(reasons: readonly string[]): boolean {
     "gateway_stream_invalid",
     "relay_proxy_no_requests",
     "relay_proxy_request_failed",
-    "local_proxy_no_requests",
-    "local_proxy_request_failed",
     "pinned_catalog_not_observed",
     "missing_login_shell",
   ]);
-  return reasons.every((reason) =>
-    retryable.has(reason) || reason.startsWith("malformed_headless_json:"));
+  return reasons.every((reason) => retryable.has(reason));
 }
 
 function snapshotEqual(left: SnapshotManifest, right: SnapshotManifest): boolean {
@@ -879,13 +966,12 @@ async function runCoordinateAttempt(input: {
   const names = {
     workspace: resourceName("workspace", identity),
     home: resourceName("home", identity),
-    agentEvidence: resourceName("agent-evidence", identity),
     relayEvidence: resourceName("relay-evidence", identity),
     internalNetwork: resourceName("internal", identity),
     edgeNetwork: resourceName("edge", identity),
     relay: resourceName("relay", identity),
   };
-  const nonce = randomBytes(32).toString("base64url");
+  const nonce = randomBytes(32).toString("hex");
   const startedAt = new Date().toISOString();
   let rawProcess: ProcessResult = {
     stdout: "",
@@ -898,11 +984,12 @@ async function runCoordinateAttempt(input: {
   let seedManifest: SnapshotManifest = { schema_version: 1, files: [], total_bytes: 0 };
   let hostEvents: ProxyEvent[] = [];
   let workspaceSnapshot: SnapshotManifest | null = null;
+  let workspaceSnapshotVolume: string | null = null;
   let persistenceFailure: string | null = null;
   const hostEventStart = host_proxy.events.length;
   try {
   try {
-    for (const volume of [names.workspace, names.home, names.agentEvidence, names.relayEvidence]) {
+    for (const volume of [names.workspace, names.home, names.relayEvidence]) {
       await resources.createVolume(volume);
     }
     seedManifest = await seedWorkspace(resources, names.workspace, testCase);
@@ -916,11 +1003,13 @@ async function runCoordinateAttempt(input: {
       container: names.relay,
       internal_network: names.internalNetwork,
       evidence_volume: names.relayEvidence,
-      nonce,
       host_proxy_url: `http://host.docker.internal:${hostPort}`,
       model: manifest.gateway.model,
     });
-    requireSuccess(await docker(relayArgs, 60_000), "start relay");
+    requireSuccess(
+      await docker(relayArgs, 60_000, coordinateNonceEnvFile(nonce)),
+      "start relay",
+    );
     resources.rememberContainer(names.relay);
     requireSuccess(await docker([
       "network",
@@ -935,14 +1024,12 @@ async function runCoordinateAttempt(input: {
       network: names.internalNetwork,
       workspace_volume: names.workspace,
       home_volume: names.home,
-      evidence_volume: names.agentEvidence,
       binary_path: binary.path,
       model: manifest.gateway.model,
       prompt: promptForArm(testCase, coordinate.arm),
-      nonce,
       timeout_ms: manifest.execution.coordinate_timeout_ms,
       agent_steps: manifest.execution.agent_step_limit,
-    }), manifest.execution.coordinate_timeout_ms + 60_000);
+    }), manifest.execution.coordinate_timeout_ms + 60_000, coordinateNonceEnvFile(nonce));
     hostEvents = host_proxy.events.slice(hostEventStart);
 
     writeAtomic(join(attemptDirectory, "fx-stdout.json"), rawProcess.stdout);
@@ -963,7 +1050,6 @@ async function runCoordinateAttempt(input: {
 
     for (const [source, label] of [
       [names.workspace, "workspace"],
-      [names.agentEvidence, "agent-evidence"],
       [names.relayEvidence, "relay-evidence"],
     ] as const) {
       const snapshot = resourceName(`${label}-snapshot`, identity);
@@ -975,6 +1061,7 @@ async function runCoordinateAttempt(input: {
         `${identity}:${label}`,
       );
       if (label === "workspace") {
+        workspaceSnapshotVolume = snapshot;
         workspaceSnapshot = readJson<SnapshotManifest>(
           join(attemptDirectory, label, "snapshot-manifest.json"),
         );
@@ -1010,36 +1097,35 @@ async function runCoordinateAttempt(input: {
   } catch (error) {
     parseError = error instanceof Error ? error.message : String(error);
   }
-  const tracePath = join(attemptDirectory, "agent-evidence", "fx.trace");
-  const localLogPath = join(attemptDirectory, "agent-evidence", "local-proxy.jsonl");
   const relayLogPath = join(attemptDirectory, "relay-evidence", "relay-proxy.jsonl");
-  const trace = existsSync(tracePath) ? readFileSync(tracePath, "utf8") : "";
-  let localEvents: ProxyEvent[] = [];
   let relayEvents: ProxyEvent[] = [];
   try {
-    localEvents = parseJsonLines(localLogPath);
     relayEvents = parseJsonLines(relayLogPath);
   } catch (error) {
-    parseError = `${parseError ?? ""}; proxy log parse: ${error instanceof Error ? error.message : String(error)}`;
+    const message = `relay log parse: ${
+      error instanceof Error ? error.message : String(error)
+    }`;
+    persistenceFailure = persistenceFailure
+      ? `${persistenceFailure}; ${message}`
+      : message;
   }
   const validity = classifyCoordinateValidity({
     coordinate,
     process: rawProcess,
     headless,
-    parse_error: persistenceFailure ?? parseError,
+    parse_error: parseError,
+    evidence_persistence_error: persistenceFailure ?? undefined,
     host_events: hostEvents,
     relay_events: relayEvents,
-    local_events: localEvents,
-    trace,
   });
 
   const grades: CoordinateResult["grades"] = { visible: null, held_out: null, submitted: null };
-  if (workspaceSnapshot && testCase.kind === "mutation") {
+  if (workspaceSnapshot && workspaceSnapshotVolume && testCase.kind === "mutation") {
     for (const suite of ["visible", "held-out", "submitted"] as const) {
       const gradeVolume = resourceName(`grade-${suite}`, identity);
       grades[suite === "held-out" ? "held_out" : suite] = await gradeNamedVolume(
         resources,
-        names.workspace,
+        workspaceSnapshotVolume,
         gradeVolume,
         testCase,
         suite,
@@ -1098,7 +1184,6 @@ async function runCampaign(
     gateway_team: credential.gateway_team,
     model: manifest.gateway.model,
     allowed_nonces: allowedNonces,
-    hostname: "0.0.0.0",
     port: 0,
     timeout_ms: Math.min(manifest.execution.coordinate_timeout_ms, 240_000),
   });
@@ -1336,11 +1421,10 @@ async function binaryVersion(image: string, path: string): Promise<string> {
   return result.stdout.trim();
 }
 
-function preflightDockerArgs(input: {
+export function preflightDockerArgs(input: {
   image: string;
   workspace: string;
   home: string;
-  evidence: string;
   binary: string;
   model: string;
 }): string[] {
@@ -1353,8 +1437,6 @@ function preflightDockerArgs(input: {
     `${input.workspace}:/workspace`,
     "-v",
     `${input.home}:/home/bun`,
-    "-v",
-    `${input.evidence}:/evidence`,
     "-v",
     `${input.binary}:/opt/fx/fx:ro`,
     "-w",
@@ -1387,7 +1469,6 @@ async function runBinaryPreflight(input: {
   const resources = new DockerResources(input.image);
   const workspace = resourceName("preflight-workspace", identity);
   const home = resourceName("preflight-home", identity);
-  const evidence = resourceName("preflight-evidence", identity);
   const artifactDirectory = join(input.output_directory, input.label);
   mkdirSync(artifactDirectory, { recursive: true, mode: 0o700 });
   let processResult: ProcessResult = {
@@ -1401,26 +1482,17 @@ async function runBinaryPreflight(input: {
   const reasons: string[] = [];
   let shell: string | null = null;
   try {
-    for (const volume of [workspace, home, evidence]) await resources.createVolume(volume);
+    for (const volume of [workspace, home]) await resources.createVolume(volume);
     processResult = await docker(preflightDockerArgs({
       image: input.image,
       workspace,
       home,
-      evidence,
       binary: input.binary,
       model: input.model,
     }), 120_000);
     writeAtomic(join(artifactDirectory, "fx-stdout.json"), processResult.stdout);
     writeAtomic(join(artifactDirectory, "fx-stderr.txt"), processResult.stderr);
     writeAtomic(join(artifactDirectory, "raw-process.json"), canonicalJson(processResult));
-    const evidenceSnapshot = resourceName("preflight-evidence-snapshot", identity);
-    await snapshotNamedVolume(resources, evidence, evidenceSnapshot, "pilot-temp-cleanup");
-    await exportTrustedVolume(
-      resources,
-      evidenceSnapshot,
-      join(artifactDirectory, "evidence"),
-      `${identity}:evidence`,
-    );
   } catch (error) {
     reasons.push(`preflight_persistence:${error instanceof Error ? error.message : String(error)}`);
   }
@@ -1430,21 +1502,9 @@ async function runBinaryPreflight(input: {
   } catch {
     reasons.push("malformed_headless_json");
   }
-  const logPath = join(artifactDirectory, "evidence", "local-proxy.jsonl");
-  let events: ProxyEvent[] = [];
-  try {
-    events = parseJsonLines(logPath);
-  } catch {
-    reasons.push("malformed_preflight_proxy_log");
-  }
-  for (let index = events.length - 1; index >= 0; index -= 1) {
-    if (events[index]?.preflight_shell) {
-      shell = events[index]!.preflight_shell!;
-      break;
-    }
-  }
-  const tracePath = join(artifactDirectory, "evidence", "fx.trace");
-  const trace = existsSync(tracePath) ? readFileSync(tracePath, "utf8") : "";
+  shell = processResult.stderr.match(
+    /^fx-terminal-preflight:(\/bin\/(?:ba)?sh)$/m,
+  )?.[1] ?? null;
   if (processResult.code !== 0 || processResult.timed_out) reasons.push("preflight_process_failed");
   const expectedStderr =
     "Running printf 'fx-terminal-preflight:%s\\n' \"$SHELL\"\n" +
@@ -1458,10 +1518,7 @@ async function runBinaryPreflight(input: {
     call.name === "terminal" && call.status === "success" && call.command_result?.exit_code === 0
   )) reasons.push("terminal_tool_did_not_succeed");
   if (shell !== "/bin/sh" && shell !== "/bin/bash") reasons.push("terminal_shell_marker_missing");
-  if (events.some((event) => event.outcome === "rejected" || event.outcome === "upstream-error")) {
-    reasons.push("preflight_proxy_rejected_request");
-  }
-  if (`${processResult.stdout}\n${processResult.stderr}\n${trace}`.includes("MissingLoginShell")) {
+  if (`${processResult.stdout}\n${processResult.stderr}`.includes("MissingLoginShell")) {
     reasons.push("missing_login_shell");
   }
   await resources.cleanup();
@@ -1555,8 +1612,11 @@ async function freezeCampaign(args: readonly string[]): Promise<void> {
   }
   const trialsRaw = optionalFlag(args, "--trials");
   const trials = trialsRaw ? Number(trialsRaw) : undefined;
-  if (phase === "final" && trials !== undefined && trials !== FINAL_TRIALS_PER_CASE) {
-    throw new Error(`final campaign requires exactly ${FINAL_TRIALS_PER_CASE} trials per case`);
+  const expectedTrials = phase === "final"
+    ? FINAL_TRIALS_PER_CASE
+    : PILOT_TRIALS_PER_CASE;
+  if (trials !== undefined && trials !== expectedTrials) {
+    throw new Error(`${phase} campaign requires exactly ${expectedTrials} trials per case`);
   }
   const upstream = optionalFlag(args, "--upstream") ?? DEFAULT_UPSTREAM;
   const manifest = buildFrozenManifest({
@@ -1717,7 +1777,6 @@ async function runDockerSmoke(args: readonly string[]): Promise<void> {
     credential: "smoke-host-secret",
     model,
     allowed_nonces: allowedNonces,
-    hostname: "0.0.0.0",
     port: 0,
     timeout_ms: 60_000,
   });

@@ -68,7 +68,6 @@ function fxEnvironment(home: string, model: string): NodeJS.ProcessEnv {
     FX_MAX_AGENT_STEPS: requiredEnv("FX_VERIFICATION_AGENT_STEPS"),
     FX_MODEL: model,
     FX_PERMISSION_MODE: "auto",
-    FX_TRACE_LOG: "/evidence/fx.trace",
   };
 }
 
@@ -149,15 +148,13 @@ async function runFx(prompt: string): Promise<ProcessResult> {
 async function main(): Promise<void> {
   const mode = process.argv[2];
   const model = requiredEnv("FX_MODEL");
-  const logPath = "/evidence/local-proxy.jsonl";
   const gateway = mode === "preflight"
-    ? startFakePreflightGateway({ model, port: 43123, log_path: logPath })
+    ? startFakePreflightGateway({ model, port: 43123 })
     : mode === "coordinate"
     ? startLocalForwarder({
       nonce: requiredEnv("FX_VERIFICATION_NONCE"),
       relay_url: requiredEnv("FX_VERIFICATION_RELAY_URL"),
       port: 43123,
-      log_path: logPath,
     })
     : null;
   if (!gateway) throw new Error("usage: verification-container.ts <preflight|coordinate>");

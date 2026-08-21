@@ -13,6 +13,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { dirname, join, relative, resolve, sep } from "node:path";
+import { compareStrings } from "./verification-common";
 import {
   MAX_FIXTURE_FILE_BYTES,
   MAX_FIXTURE_TOTAL_BYTES,
@@ -48,6 +49,22 @@ export interface PreparedGrade {
   copied_submitted_tests: CopiedFile[];
 }
 
+export interface BunTestSummary {
+  tests: number;
+  assertions: number;
+  failures: number;
+  skipped: number;
+  completed: number;
+}
+
+export interface GradeProcessResult {
+  exit_code: number | null;
+  signal: NodeJS.Signals | null;
+  timed_out: boolean;
+  stdout: string;
+  stderr: string;
+}
+
 export interface GradeResult extends PreparedGrade {
   status: "passed" | "failed" | "no-tests" | "invalid";
   exit_code: number | null;
@@ -55,6 +72,7 @@ export interface GradeResult extends PreparedGrade {
   timed_out: boolean;
   stdout: string;
   stderr: string;
+  test_summary: BunTestSummary | null;
   error?: string;
 }
 
@@ -218,7 +236,7 @@ export function seedFixture(
     ...(implementation === "correct" ? testCase.correct_files : {}),
   };
   const copied = Object.entries(files)
-    .sort(([left], [right]) => left.localeCompare(right))
+    .sort(([left], [right]) => compareStrings(left, right))
     .map(([path, content]) => writeCanonicalFile(targetRoot, path, content));
   const total_bytes = copied.reduce((sum, file) => sum + file.bytes, 0);
   if (total_bytes > MAX_FIXTURE_TOTAL_BYTES) {
@@ -250,7 +268,11 @@ export function prepareGradeWorkspace(
   const baseFiles = suite === "submitted"
     ? { ...canonicalBaseFiles(testCase), ...testCase.correct_files }
     : canonicalBaseFiles(testCase);
-  for (const [path, content] of Object.entries(baseFiles).sort(([left], [right]) => left.localeCompare(right))) {
+  for (
+    const [path, content] of Object.entries(baseFiles).sort(
+      ([left], [right]) => compareStrings(left, right),
+    )
+  ) {
     writeCanonicalFile(targetRoot, path, content);
   }
 
@@ -323,13 +345,89 @@ export function snapshotWorkspace(sourceRoot: string, targetRoot: string): Snaps
   return manifest;
 }
 
+function integerAttribute(attributes: string, name: string): number | null {
+  const match = attributes.match(new RegExp(`(?:^|\\s)${name}="([0-9]+)"(?:\\s|$)`));
+  if (!match) return null;
+  const value = Number(match[1]);
+  return Number.isSafeInteger(value) ? value : null;
+}
+
+export function parseBunTestSummary(stdout: string): BunTestSummary | null {
+  const reports = [...stdout.matchAll(
+    /<\?xml version="1\.0" encoding="UTF-8"\?>\s*<testsuites\b([^>]*)>[\s\S]*?<\/testsuites>/g,
+  )];
+  if (reports.length !== 1) return null;
+  const attributes = reports[0]![1]!;
+  const tests = integerAttribute(attributes, "tests");
+  const assertions = integerAttribute(attributes, "assertions");
+  const failures = integerAttribute(attributes, "failures");
+  const skipped = integerAttribute(attributes, "skipped");
+  if (
+    tests === null ||
+    assertions === null ||
+    failures === null ||
+    skipped === null ||
+    skipped > tests ||
+    failures > tests
+  ) return null;
+  return {
+    tests,
+    assertions,
+    failures,
+    skipped,
+    completed: tests - skipped,
+  };
+}
+
+export function gradeResultFromProcess(
+  prepared: PreparedGrade,
+  processResult: GradeProcessResult,
+): GradeResult {
+  if (prepared.test_files.length === 0) {
+    return {
+      ...prepared,
+      ...processResult,
+      status: "no-tests",
+      test_summary: null,
+    };
+  }
+  const summary = parseBunTestSummary(processResult.stdout);
+  if (!summary || summary.completed === 0) {
+    return {
+      ...prepared,
+      ...processResult,
+      status: "invalid",
+      test_summary: summary,
+      error: summary
+        ? "grader reported no completed tests"
+        : "grader emitted no complete Bun test summary",
+    };
+  }
+  return {
+    ...prepared,
+    ...processResult,
+    status: processResult.exit_code === 0 &&
+        !processResult.timed_out &&
+        summary.failures === 0
+      ? "passed"
+      : "failed",
+    test_summary: summary,
+  };
+}
+
 async function runTests(
   root: string,
   testFiles: readonly string[],
   timeoutMs: number,
-): Promise<Pick<GradeResult, "exit_code" | "signal" | "timed_out" | "stdout" | "stderr">> {
+): Promise<GradeProcessResult> {
   return await new Promise((resolvePromise, reject) => {
-    const child = nodeSpawn("bun", ["test", ...testFiles], {
+    const child = nodeSpawn("bun", [
+      "test",
+      ...testFiles,
+      "--reporter=junit",
+      "--reporter-outfile",
+      "/dev/stdout",
+    ], {
       cwd: root,
       env: {
         HOME: process.env.HOME ?? "/tmp",
@@ -341,10 +439,12 @@ async function runTests(
     const stdout: Buffer[] = [];
     const stderr: Buffer[] = [];
     let outputBytes = 0;
+    let outputExceeded = false;
     let timedOut = false;
     const append = (target: Buffer[], value: Buffer): void => {
       outputBytes += value.byteLength;
       if (outputBytes > MAX_GRADE_OUTPUT_BYTES) {
+        outputExceeded = true;
         child.kill("SIGKILL");
         return;
       }
@@ -364,7 +464,9 @@ async function runTests(
         signal,
         timed_out: timedOut,
         stdout: Buffer.concat(stdout).toString(),
-        stderr: Buffer.concat(stderr).toString(),
+        stderr: `${Buffer.concat(stderr).toString()}${
+          outputExceeded ? "grader output exceeded limit\n" : ""
+        }`,
       });
     });
   });
@@ -380,24 +482,18 @@ export async function gradeWorkspace(
   try {
     const prepared = prepareGradeWorkspace(testCase, suite, sourceRoot, targetRoot);
     if (prepared.test_files.length === 0) {
-      return {
-        ...prepared,
-        status: "no-tests",
+      return gradeResultFromProcess(prepared, {
         exit_code: null,
         signal: null,
         timed_out: false,
         stdout: "",
         stderr: "",
-      };
+      });
     }
-    const processResult = await runTests(targetRoot, prepared.test_files, timeoutMs);
-    return {
-      ...prepared,
-      ...processResult,
-      status: processResult.exit_code === 0 && !processResult.timed_out
-        ? "passed"
-        : "failed",
-    };
+    return gradeResultFromProcess(
+      prepared,
+      await runTests(targetRoot, prepared.test_files, timeoutMs),
+    );
   } catch (error) {
     return {
       suite,
@@ -410,6 +506,7 @@ export async function gradeWorkspace(
       timed_out: false,
       stdout: "",
       stderr: "",
+      test_summary: null,
       error: error instanceof Error ? error.message : String(error),
     };
   }
@@ -439,22 +536,21 @@ async function main(): Promise<void> {
     process.stdout.write(canonicalJson(manifest));
     return;
   }
-  if (command === "grade") {
+  if (command === "prepare") {
     const suite = argument("--suite") as GradeSuite;
     if (!(["visible", "held-out", "submitted"] as string[]).includes(suite)) {
       throw new Error(`invalid --suite: ${suite}`);
     }
-    const result = await gradeWorkspace(
+    const prepared = prepareGradeWorkspace(
       testCase,
       suite,
       argument("--source"),
       argument("--target"),
     );
-    process.stdout.write(canonicalJson(result));
-    if (result.status === "invalid") process.exitCode = 2;
+    process.stdout.write(canonicalJson(prepared));
     return;
   }
-  throw new Error(`usage: verification-grader.ts <seed|snapshot|grade> --case ID ...`);
+  throw new Error(`usage: verification-grader.ts <seed|snapshot|prepare> --case ID ...`);
 }
 
 if (import.meta.main) {

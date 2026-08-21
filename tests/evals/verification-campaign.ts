@@ -1,4 +1,8 @@
-import { canonicalJson, sha256Text } from "./verification-common";
+import {
+  VERIFICATION_REMINDER,
+  canonicalJson,
+  sha256Text,
+} from "./verification-common";
 import {
   CORRECT_POOL_SOURCE,
   FLAWED_POOL_SOURCE,
@@ -17,12 +21,7 @@ export const PILOT_TRIALS_PER_CASE = 2;
 export const MAX_FIXTURE_FILE_BYTES = 256 * 1024;
 export const MAX_FIXTURE_TOTAL_BYTES = 2 * 1024 * 1024;
 
-export const UPFRONT_VERIFICATION_INSTRUCTION =
-  "Before finalizing, verify the completed change against the user's request. " +
-  "Re-read the changed contract and modified files. If correctness depends on " +
-  "interacting states or events, exercise at least one combined transition. " +
-  "Confirm promised effects completed rather than merely began. Fix any " +
-  "discrepancy, then report concrete verification evidence.";
+export const UPFRONT_VERIFICATION_INSTRUCTION = VERIFICATION_REMINDER;
 
 export type CampaignPhase = "pilot" | "final";
 export type VerificationCaseKind = "mutation" | "read-only";
@@ -805,23 +804,44 @@ export interface FreezeManifestInput {
   agent_step_limit?: number;
 }
 
-export function buildFrozenManifest(input: FreezeManifestInput): FrozenCampaignManifest {
-  const test_cases = casesForPhase(input.phase);
-  const trials = input.trials_per_case ??
-    (input.phase === "final" ? FINAL_TRIALS_PER_CASE : PILOT_TRIALS_PER_CASE);
-  if (!Number.isInteger(trials) || trials < 1) {
-    throw new Error(`trials_per_case must be a positive integer, got ${trials}`);
-  }
+function trialsForPhase(phase: CampaignPhase): number {
+  return phase === "final" ? FINAL_TRIALS_PER_CASE : PILOT_TRIALS_PER_CASE;
+}
+
+function frozenCasesForPhase(
+  phase: CampaignPhase,
+): FrozenCampaignManifest["cases"] {
+  return casesForPhase(phase).map((test_case) => ({
+    id: test_case.id,
+    kind: test_case.kind,
+    family: test_case.family,
+    prompt_sha256: sha256Text(test_case.prompt),
+    fixture_sha256: verificationCaseDigest(test_case),
+  }));
+}
+
+function coordinatesForPhase(
+  phase: CampaignPhase,
+  trials: number,
+): FrozenCampaignManifest["coordinates"] {
   const coordinates: FrozenCampaignManifest["coordinates"] = [];
-  for (const test_case of test_cases) {
+  for (const test_case of casesForPhase(phase)) {
     for (let trial_index = 0; trial_index < trials; trial_index += 1) {
-      const order = input.phase === "pilot"
+      const order = phase === "pilot"
         ? createPilotOrder(trial_index)
         : createTrialOrder(trial_index);
       order.forEach((arm, order_index) => {
         coordinates.push({ case_id: test_case.id, trial_index, order_index, arm });
       });
     }
+  }
+  return coordinates;
+}
+
+export function buildFrozenManifest(input: FreezeManifestInput): FrozenCampaignManifest {
+  const trials = input.trials_per_case ?? trialsForPhase(input.phase);
+  if (!Number.isInteger(trials) || trials < 1) {
+    throw new Error(`trials_per_case must be a positive integer, got ${trials}`);
   }
   const without_hash = {
     schema_version: VERIFICATION_CAMPAIGN_SCHEMA_VERSION,
@@ -842,14 +862,8 @@ export function buildFrozenManifest(input: FreezeManifestInput): FrozenCampaignM
     binaries: { baseline: input.baseline, candidate: input.candidate },
     reminder_sha256: sha256Text(UPFRONT_VERIFICATION_INSTRUCTION),
     trials_per_case: trials,
-    cases: test_cases.map((test_case) => ({
-      id: test_case.id,
-      kind: test_case.kind,
-      family: test_case.family,
-      prompt_sha256: sha256Text(test_case.prompt),
-      fixture_sha256: verificationCaseDigest(test_case),
-    })),
-    coordinates,
+    cases: frozenCasesForPhase(input.phase),
+    coordinates: coordinatesForPhase(input.phase, trials),
   };
   return {
     ...without_hash,
@@ -861,23 +875,31 @@ export function validateFrozenManifest(manifest: FrozenCampaignManifest): void {
   if (manifest.schema_version !== VERIFICATION_CAMPAIGN_SCHEMA_VERSION) {
     throw new Error(`unsupported manifest schema: ${manifest.schema_version}`);
   }
+  if (manifest.phase !== "pilot" && manifest.phase !== "final") {
+    throw new Error(`unsupported campaign phase: ${String(manifest.phase)}`);
+  }
   const { manifest_sha256, ...without_hash } = manifest;
   const actual = sha256Text(canonicalJson(without_hash));
   if (actual !== manifest_sha256) {
     throw new Error(`manifest hash mismatch: expected ${manifest_sha256}, got ${actual}`);
   }
-  const expected_cases = casesForPhase(manifest.phase);
-  if (expected_cases.length !== manifest.cases.length) {
-    throw new Error("manifest case count does not match the frozen campaign source");
+  const expectedTrials = trialsForPhase(manifest.phase);
+  if (manifest.trials_per_case !== expectedTrials) {
+    throw new Error(
+      `${manifest.phase} campaign requires exactly ${expectedTrials} trials per case`,
+    );
   }
-  for (const test_case of expected_cases) {
-    const frozen = manifest.cases.find((value) => value.id === test_case.id);
-    if (!frozen || frozen.fixture_sha256 !== verificationCaseDigest(test_case)) {
-      throw new Error(`fixture changed after freeze: ${test_case.id}`);
-    }
-    if (frozen.prompt_sha256 !== sha256Text(test_case.prompt)) {
-      throw new Error(`prompt changed after freeze: ${test_case.id}`);
-    }
+  const expectedReminder = sha256Text(UPFRONT_VERIFICATION_INSTRUCTION);
+  if (manifest.reminder_sha256 !== expectedReminder) {
+    throw new Error("manifest reminder digest does not match the campaign source");
+  }
+  const expectedCases = frozenCasesForPhase(manifest.phase);
+  if (canonicalJson(manifest.cases) !== canonicalJson(expectedCases)) {
+    throw new Error("manifest cases do not match the frozen campaign source");
+  }
+  const expectedCoordinates = coordinatesForPhase(manifest.phase, expectedTrials);
+  if (canonicalJson(manifest.coordinates) !== canonicalJson(expectedCoordinates)) {
+    throw new Error("manifest coordinates do not match the frozen campaign design");
   }
 }
 

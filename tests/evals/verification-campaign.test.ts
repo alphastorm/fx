@@ -14,6 +14,7 @@ import {
   exactMcNemarP,
   pairedLiftConfidenceInterval,
   summarizePairs,
+  sha256Text,
   validateFrozenManifest,
   type PairedOutcome,
   type VerificationCase,
@@ -161,6 +162,26 @@ describe("frozen manifest", () => {
     revision: "abc123",
   };
 
+  function pilotManifest() {
+    return buildFrozenManifest({
+      phase: "pilot",
+      created_at: "2026-08-21T00:00:00.000Z",
+      preflight_sha256: "f".repeat(64),
+      image_reference: "oven/bun@sha256:example",
+      image_digest: "sha256:example",
+      gateway_upstream: "https://example.invalid/chat",
+      model: "provider/model",
+      catalog_json: '{"data":[]}',
+      baseline: binary,
+      candidate: { ...binary, sha256: "b".repeat(64) },
+    });
+  }
+
+  function resign(manifest: ReturnType<typeof pilotManifest>): void {
+    const { manifest_sha256: _discarded, ...withoutHash } = manifest;
+    manifest.manifest_sha256 = sha256Text(canonicalJson(withoutHash));
+  }
+
   test("final manifest freezes all 160 balanced coordinates", () => {
     const manifest = buildFrozenManifest({
       phase: "final",
@@ -195,20 +216,48 @@ describe("frozen manifest", () => {
   });
 
   test("manifest validation rejects post-freeze changes", () => {
-    const manifest = buildFrozenManifest({
-      phase: "pilot",
-      created_at: "2026-08-21T00:00:00.000Z",
-      preflight_sha256: "f".repeat(64),
-      image_reference: "oven/bun@sha256:example",
-      image_digest: "sha256:example",
-      gateway_upstream: "https://example.invalid/chat",
-      model: "provider/model",
-      catalog_json: '{"data":[]}',
-      baseline: binary,
-      candidate: { ...binary, sha256: "b".repeat(64) },
-    });
+    const manifest = pilotManifest();
     manifest.gateway.model = "changed/model";
     expect(() => validateFrozenManifest(manifest)).toThrow("manifest hash mismatch");
+  });
+
+  test("re-hashed manifest truncation still fails the frozen campaign design", () => {
+    const manifest = pilotManifest();
+    manifest.coordinates.pop();
+    resign(manifest);
+
+    expect(() => validateFrozenManifest(manifest)).toThrow(
+      "manifest coordinates do not match the frozen campaign design",
+    );
+  });
+
+  test("re-hashed trial, reminder, and case metadata tampering fail closed", () => {
+    const trials = pilotManifest();
+    trials.trials_per_case = 1;
+    resign(trials);
+    expect(() => validateFrozenManifest(trials)).toThrow(
+      "pilot campaign requires exactly 2 trials per case",
+    );
+
+    const reminder = pilotManifest();
+    reminder.reminder_sha256 = "0".repeat(64);
+    resign(reminder);
+    expect(() => validateFrozenManifest(reminder)).toThrow(
+      "manifest reminder digest does not match the campaign source",
+    );
+
+    const cases = pilotManifest();
+    cases.cases[0]!.family = "tampered-family";
+    resign(cases);
+    expect(() => validateFrozenManifest(cases)).toThrow(
+      "manifest cases do not match the frozen campaign source",
+    );
+  });
+
+  test("canonical JSON uses deterministic UTF-16 code-unit ordering", () => {
+    expect(canonicalJson({ "ä": 1, a: 2, _: 3, Z: 4, A: 5 })).toBe(
+      '{\n  "A": 5,\n  "Z": 4,\n  "_": 3,\n  "a": 2,\n  "ä": 1\n}\n',
+    );
   });
 
   test("pilot order rotates every arm through every position", () => {

@@ -1,6 +1,10 @@
 import { appendFileSync, mkdirSync } from "node:fs";
 import { dirname } from "node:path";
-import { canonicalJson, sha256Text } from "./verification-common";
+import {
+  VERIFICATION_REMINDER,
+  canonicalJson,
+  sha256Text,
+} from "./verification-common";
 
 export const CHAT_PATH = "/v3/ai/language-model";
 export const CATALOG_PATH = "/coding-agent/v1/models";
@@ -203,6 +207,7 @@ export interface ProxyEvent {
   upstream_status?: number;
   response_bytes?: number;
   evidence?: GatewaySseEvidence;
+  verification_reminder_count?: number;
   reason?: string;
 }
 
@@ -277,17 +282,54 @@ function responseHeaders(source: Headers): Headers {
   return headers;
 }
 
-function requestModel(request: Request, body: Uint8Array): string | null {
-  const header = request.headers.get("ai-language-model-id");
-  if (header) return header;
+interface RequestInspection {
+  model_selectors: string[];
+  verification_reminder_count: number;
+}
+
+function inspectRequest(request: Request, body: Uint8Array): RequestInspection | null {
+  let parsed: unknown;
   try {
-    const parsed = JSON.parse(new TextDecoder().decode(body)) as unknown;
-    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
-    const model = (parsed as Record<string, unknown>).model;
-    return typeof model === "string" ? model : null;
+    parsed = JSON.parse(new TextDecoder().decode(body));
   } catch {
     return null;
   }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+
+  const model_selectors: string[] = [];
+  const header = request.headers.get("ai-language-model-id");
+  if (header) model_selectors.push(header);
+  const record = parsed as Record<string, unknown>;
+  if (Object.hasOwn(record, "model")) {
+    if (typeof record.model !== "string" || !record.model) return null;
+    model_selectors.push(record.model);
+  }
+  if (model_selectors.length === 0) return null;
+
+  let verification_reminder_count = 0;
+  let visited = 0;
+  const pending: unknown[] = [parsed];
+  while (pending.length > 0) {
+    const value = pending.pop();
+    visited += 1;
+    if (visited > 200_000) return null;
+    if (value === VERIFICATION_REMINDER) {
+      verification_reminder_count += 1;
+    } else if (Array.isArray(value)) {
+      pending.push(...value);
+    } else if (value && typeof value === "object") {
+      pending.push(...Object.values(value));
+    }
+  }
+  return { model_selectors, verification_reminder_count };
+}
+
+function requestMatchesModel(
+  inspection: RequestInspection | null,
+  model: string,
+): inspection is RequestInspection {
+  return inspection !== null &&
+    inspection.model_selectors.every((selector) => selector === model);
 }
 
 export interface HostGatewayProxyConfig {
@@ -296,7 +338,6 @@ export interface HostGatewayProxyConfig {
   gateway_team?: string;
   model: string;
   allowed_nonces: ReadonlySet<string>;
-  hostname?: string;
   port?: number;
   timeout_ms?: number;
   log_path?: string;
@@ -319,7 +360,7 @@ export function startHostGatewayProxy(config: HostGatewayProxyConfig): RunningGa
   }
   const events: ProxyEvent[] = [];
   const server = Bun.serve({
-    hostname: config.hostname ?? "127.0.0.1",
+    hostname: "127.0.0.1",
     port: config.port ?? 0,
     idleTimeout: PROXY_IDLE_TIMEOUT_SECONDS,
     async fetch(request) {
@@ -344,7 +385,10 @@ export function startHostGatewayProxy(config: HostGatewayProxyConfig): RunningGa
       } catch (error) {
         return reject(error instanceof Error ? error.message : String(error), 413);
       }
-      if (requestModel(request, body) !== config.model) return reject("unpinned request model", 400);
+      const inspection = inspectRequest(request, body);
+      if (!requestMatchesModel(inspection, config.model)) {
+        return reject("unpinned request model", 400);
+      }
       const headers = forwardedHeaders(request.headers);
       headers.set("authorization", `Bearer ${config.credential}`);
       headers.set("content-type", "application/json");
@@ -355,6 +399,7 @@ export function startHostGatewayProxy(config: HostGatewayProxyConfig): RunningGa
         nonce_sha256: nonceHash,
         request_bytes: body.byteLength,
         request_sha256: sha256Text(body),
+        verification_reminder_count: inspection.verification_reminder_count,
       };
       try {
         const response = await fetch(config.upstream_url, {
@@ -605,7 +650,8 @@ export function startFakePreflightGateway(config: FakePreflightConfig): RunningG
         return new Response("unexpected fake route", { status: 404 });
       }
       const body = await boundedRequestBody(request);
-      if (requestModel(request, body) !== config.model) {
+      const inspection = inspectRequest(request, body);
+      if (!requestMatchesModel(inspection, config.model)) {
         recordEvent(events, {
           ...baseEvent("fake", "rejected", request),
           request_bytes: body.byteLength,
