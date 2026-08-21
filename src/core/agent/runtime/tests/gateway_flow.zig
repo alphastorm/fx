@@ -5901,11 +5901,13 @@ test "processQueuedPrompt no-tool length preserves completed presentation with l
     );
 }
 
-test "processQueuedPrompt appends final verification after a successful mutation" {
+test "processQueuedPrompt injects final verification only into the completion after mutation" {
     const alloc = std.testing.allocator;
-    const calls = [_]ToolCall{toolCall("call_1", "write_file", "{\"path\":\"a\",\"content\":\"x\"}")};
+    const mutation_calls = [_]ToolCall{toolCall("call_1", "write_file", "{\"path\":\"a\",\"content\":\"x\"}")};
+    const continuation_calls = [_]ToolCall{toolCall("call_2", "read_file", "{\"path\":\"a\"}")};
     const completions = [_]FakeCompletion{
-        .{ .tool_calls = &calls },
+        .{ .tool_calls = &mutation_calls },
+        .{ .tool_calls = &continuation_calls },
         .{ .content = "Verified" },
     };
     var gateway = FakeGateway.init(alloc, &completions);
@@ -5918,16 +5920,26 @@ test "processQueuedPrompt appends final verification after a successful mutation
 
     try runFakePrompt(&gateway, &hooks, config, fixture.job());
 
+    try std.testing.expectEqual(@as(usize, 3), gateway.request_bodies.items.len);
+    try expectBodyNotContains(&gateway, 0, "Before finalizing, verify");
     try expectBodyContains(&gateway, 1, "Before finalizing, verify the completed change against the user's request.");
     try expectBodyContains(&gateway, 1, "exercise at least one combined transition");
     try expectBodyContains(&gateway, 1, "effects completed rather than merely began");
+    try expectBodyNotContains(&gateway, 2, "Before finalizing, verify");
 }
 
-test "processQueuedPrompt excludes successful non-file write executors from final verification" {
+test "processQueuedPrompt excludes successful non-file executors from final verification" {
     const alloc = std.testing.allocator;
-    const tool_names = [_][]const u8{ "memory", "install_skill" };
-    for (tool_names) |tool_name| {
-        const calls = [_]ToolCall{toolCall("call_non_file_write", tool_name, "{}")};
+    const cases = [_]struct {
+        tool_name: []const u8,
+        arguments_json: []const u8,
+    }{
+        .{ .tool_name = "memory", .arguments_json = "{}" },
+        .{ .tool_name = "install_skill", .arguments_json = "{}" },
+        .{ .tool_name = "terminal", .arguments_json = "{\"action\":\"exec\",\"command\":\"pwd\"}" },
+    };
+    for (cases) |case| {
+        const calls = [_]ToolCall{toolCall("call_non_file_write", case.tool_name, case.arguments_json)};
         const completions = [_]FakeCompletion{
             .{ .tool_calls = &calls },
             .{ .content = "Completed" },
@@ -5940,7 +5952,12 @@ test "processQueuedPrompt excludes successful non-file write executors from fina
         var config = fixture.config();
         config.final_verification_enabled = true;
 
-        try runFakePrompt(&gateway, &hooks, config, fixture.job());
+        var job = fixture.job();
+        if (std.mem.eql(u8, case.tool_name, "terminal")) {
+            hooks.permission_decisions = &.{.once};
+            job.permission_mode = .auto;
+        }
+        try runFakePrompt(&gateway, &hooks, config, job);
 
         try expectBodyNotContains(&gateway, 1, "Before finalizing, verify");
     }
@@ -5993,7 +6010,7 @@ test "processQueuedPrompt does not append final verification after a read-only b
     try expectBodyNotContains(&gateway, 1, "Before finalizing, verify");
 }
 
-test "processQueuedPrompt appends final verification once across repair mutations" {
+test "processQueuedPrompt does not retrigger final verification for repair mutations" {
     const alloc = std.testing.allocator;
     const first_calls = [_]ToolCall{toolCall("call_1", "write_file", "{\"path\":\"a\",\"content\":\"x\"}")};
     const repair_calls = [_]ToolCall{toolCall("call_2", "write_file", "{\"path\":\"a\",\"content\":\"y\"}")};
@@ -6014,7 +6031,7 @@ test "processQueuedPrompt appends final verification once across repair mutation
 
     const prompt_prefix = "Before finalizing, verify";
     try std.testing.expectEqual(@as(usize, 1), countNeedle(gateway.request_bodies.items[1], prompt_prefix));
-    try std.testing.expectEqual(@as(usize, 1), countNeedle(gateway.request_bodies.items[2], prompt_prefix));
+    try std.testing.expectEqual(@as(usize, 0), countNeedle(gateway.request_bodies.items[2], prompt_prefix));
 }
 
 test "processQueuedPrompt excludes failed write results from final verification" {

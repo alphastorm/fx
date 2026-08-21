@@ -21,6 +21,17 @@ const ToolCall = types.ToolCall;
 const TraceContext = debug_trace.TraceContext;
 const AgentRuntimeDeps = runtime_deps.AgentRuntimeDeps;
 const ToolExecutionResult = runtime_tool_contracts.ToolExecutionResult;
+const final_verification_prompt =
+    "Before finalizing, verify the completed change against the user's request. " ++
+    "Re-read the changed contract and modified files. If correctness depends on " ++
+    "interacting states or events, exercise at least one combined transition. " ++
+    "Confirm promised effects completed rather than merely began. Fix any " ++
+    "discrepancy, then report concrete verification evidence.";
+
+pub const FinalVerificationState = struct {
+    scheduled: bool = false,
+    pending: bool = false,
+};
 
 pub const StepBatchState = struct {
     step_error_count: usize = 0,
@@ -538,29 +549,62 @@ pub fn appendOrdinaryExecutedResult(
     );
 }
 
-pub fn appendFinalVerificationContinuationSuffix(
+pub fn scheduleFinalVerification(
     enabled: bool,
-    injected: *bool,
+    state: *FinalVerificationState,
     step_ctx: TraceContext,
-    arena: Allocator,
-    within_turn_suffix: *std.ArrayList(ChatMessage),
     batch: *const StepBatchState,
-) !void {
-    if (!enabled or injected.* or !batch.step_had_mutation) return;
+) void {
+    if (!enabled or state.scheduled or !batch.step_had_mutation) return;
 
-    const prompt =
-        "Before finalizing, verify the completed change against the user's request. " ++
-        "Re-read the changed contract and modified files. If correctness depends on " ++
-        "interacting states or events, exercise at least one combined transition. " ++
-        "Confirm promised effects completed rather than merely began. Fix any " ++
-        "discrepancy, then report concrete verification evidence.";
-    try within_turn_suffix.append(arena, .{ .role = .user, .content = prompt });
-    injected.* = true;
+    state.scheduled = true;
+    state.pending = true;
+    debug_trace.eventf(
+        "agent",
+        "final_verification_scheduled",
+        step_ctx,
+        "trigger=file_mutation",
+        .{},
+    );
+}
+
+pub fn finalVerificationRequestSuffix(
+    arena: Allocator,
+    state: *const FinalVerificationState,
+    step_ctx: TraceContext,
+    within_turn_suffix: []const ChatMessage,
+) ![]const ChatMessage {
+    if (!state.pending) return within_turn_suffix;
+
+    const request_suffix = try arena.alloc(ChatMessage, within_turn_suffix.len + 1);
+    @memcpy(request_suffix[0..within_turn_suffix.len], within_turn_suffix);
+    request_suffix[within_turn_suffix.len] = .{
+        .role = .user,
+        .content = final_verification_prompt,
+        .cache_policy = .no_cache,
+    };
     debug_trace.eventf(
         "agent",
         "final_verification_injected",
         step_ctx,
         "trigger=file_mutation",
+        .{},
+    );
+    return request_suffix;
+}
+
+pub fn consumeFinalVerification(
+    state: *FinalVerificationState,
+    step_ctx: TraceContext,
+) void {
+    if (!state.pending) return;
+
+    state.pending = false;
+    debug_trace.eventf(
+        "agent",
+        "final_verification_consumed",
+        step_ctx,
+        "scope=next_completion",
         .{},
     );
 }
