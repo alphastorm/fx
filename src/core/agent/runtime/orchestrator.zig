@@ -2857,6 +2857,7 @@ fn processQueuedPromptLoop(
     defer interrupted_persisted_ptr.* = interrupted_persisted;
     var silent_tool_steps: usize = 0;
     var continuation_injected = false;
+    var final_verification_injected = false;
     var last_step_ctx = finish_trace.ctx;
     var current_step_index: usize = 0;
     var last_tool_call_name: []const u8 = "none";
@@ -7673,8 +7674,9 @@ fn processQueuedPromptLoop(
             );
             pending_image_ids = transition.pending_ids;
         }
-        try runtime_tool_batch.appendReviewContinuationSuffix(
-            config.review_enabled,
+        try runtime_tool_batch.appendFinalVerificationContinuationSuffix(
+            config.final_verification_enabled,
+            &final_verification_injected,
             arena,
             &within_turn_suffix,
             &step_batch,

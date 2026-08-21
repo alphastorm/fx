@@ -5901,12 +5901,12 @@ test "processQueuedPrompt no-tool length preserves completed presentation with l
     );
 }
 
-test "processQueuedPrompt review continuation appends active review prompt after write tool" {
+test "processQueuedPrompt appends final verification after a successful mutation" {
     const alloc = std.testing.allocator;
     const calls = [_]ToolCall{toolCall("call_1", "write_file", "{\"path\":\"a\",\"content\":\"x\"}")};
     const completions = [_]FakeCompletion{
         .{ .tool_calls = &calls },
-        .{ .content = "Reviewed" },
+        .{ .content = "Verified" },
     };
     var gateway = FakeGateway.init(alloc, &completions);
     defer gateway.deinit();
@@ -5914,11 +5914,75 @@ test "processQueuedPrompt review continuation appends active review prompt after
     defer hooks.deinit();
     var fixture = PromptFixture{};
     var config = fixture.config();
-    config.review_enabled = true;
+    config.final_verification_enabled = true;
 
     try runFakePrompt(&gateway, &hooks, config, fixture.job());
 
-    try expectBodyContains(&gateway, 1, "Review the changes you just made. Re-read any modified files and briefly note any issues (syntax errors, missing imports, logic bugs). If everything looks correct, say so.");
+    try expectBodyContains(&gateway, 1, "Before finalizing, verify the completed change against the user's request.");
+    try expectBodyContains(&gateway, 1, "exercise at least one combined transition");
+    try expectBodyContains(&gateway, 1, "effects completed rather than merely began");
+}
+
+test "processQueuedPrompt does not append final verification after a read-only batch" {
+    const alloc = std.testing.allocator;
+    const calls = [_]ToolCall{toolCall("call_read", "read_file", "{\"path\":\"a\"}")};
+    const completions = [_]FakeCompletion{
+        .{ .tool_calls = &calls },
+        .{ .content = "Read" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+    var config = fixture.config();
+    config.final_verification_enabled = true;
+
+    try runFakePrompt(&gateway, &hooks, config, fixture.job());
+
+    try expectBodyNotContains(&gateway, 1, "Before finalizing, verify");
+}
+
+test "processQueuedPrompt appends final verification once across repair mutations" {
+    const alloc = std.testing.allocator;
+    const first_calls = [_]ToolCall{toolCall("call_1", "write_file", "{\"path\":\"a\",\"content\":\"x\"}")};
+    const repair_calls = [_]ToolCall{toolCall("call_2", "write_file", "{\"path\":\"a\",\"content\":\"y\"}")};
+    const completions = [_]FakeCompletion{
+        .{ .tool_calls = &first_calls },
+        .{ .tool_calls = &repair_calls },
+        .{ .content = "Verified after repair" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+    var config = fixture.config();
+    config.final_verification_enabled = true;
+
+    try runFakePrompt(&gateway, &hooks, config, fixture.job());
+
+    const prompt_prefix = "Before finalizing, verify";
+    try std.testing.expectEqual(@as(usize, 1), countNeedle(gateway.request_bodies.items[1], prompt_prefix));
+    try std.testing.expectEqual(@as(usize, 1), countNeedle(gateway.request_bodies.items[2], prompt_prefix));
+}
+
+test "processQueuedPrompt honors disabled final verification after mutation" {
+    const alloc = std.testing.allocator;
+    const calls = [_]ToolCall{toolCall("call_1", "write_file", "{\"path\":\"a\",\"content\":\"x\"}")};
+    const completions = [_]FakeCompletion{
+        .{ .tool_calls = &calls },
+        .{ .content = "Written" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+
+    try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
+
+    try expectBodyNotContains(&gateway, 1, "Before finalizing, verify");
 }
 
 test "processQueuedPrompt trace records history shape returned tool calls and waits" {

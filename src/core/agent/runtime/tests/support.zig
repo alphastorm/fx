@@ -1752,6 +1752,7 @@ pub const PromptFixture = struct {
             .gateway_tools_json = "[]",
             .agent_step_limit = 8,
             .cancel_flag = &self.cancel_flag,
+            .final_verification_enabled = false,
             .workspace_root = self.workspace_root,
         };
     }
