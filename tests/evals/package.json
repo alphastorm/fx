@@ -4,7 +4,8 @@
   "type": "module",
   "scripts": {
     "eval": "bun test",
-    "eval:matrix": "bun run run-matrix.ts"
+    "eval:matrix": "bun run run-matrix.ts",
+    "eval:verification": "bun run verification-ab.ts"
   },
   "devDependencies": {
     "@types/bun": "latest",

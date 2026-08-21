@@ -467,6 +467,40 @@ pub fn processCommittedFileResult(
     completed_tool_names.appendAssumeCapacity(committed_file_tool_name);
 }
 
+fn executorMutatesWorkspaceFiles(kind: tool_dispatch.ExecutorKind) bool {
+    return switch (kind) {
+        .write_file,
+        .edit_file,
+        .delete_file,
+        .rename_file,
+        .copy_file,
+        .create_folder,
+        => true,
+        .list_files,
+        .glob_files,
+        .grep_files,
+        .read_file,
+        .read_tool_result,
+        .file_info,
+        .memory,
+        .semantic_search,
+        .open_file,
+        .web_fetch,
+        .web_search,
+        .run_command,
+        .terminal,
+        .skill,
+        .install_skill,
+        .subagent,
+        .mcp_search_tools,
+        .mcp_select_tool,
+        .mcp_features,
+        .ask_user_question,
+        .vision,
+        => false,
+    };
+}
+
 pub fn appendOrdinaryExecutedResult(
     tool_registry: tool_dispatch.Registry,
     arena: Allocator,
@@ -478,7 +512,10 @@ pub fn appendOrdinaryExecutedResult(
     memory: types.ToolResultMemory,
     execution: ToolExecutionResult,
 ) !void {
-    const activity = runtime_tool_presentation.activityKindForCall(arena, tool_registry, tool_call);
+    const mutates_workspace_files = if (tool_registry.lookup(tool_call.name)) |tool|
+        executorMutatesWorkspaceFiles(tool.executor_kind)
+    else
+        false;
     try appendToolResultContent(
         arena,
         within_turn_suffix,
@@ -490,7 +527,7 @@ pub fn appendOrdinaryExecutedResult(
         .{
             .increment_error = execution.status == .failure or tool_result_errors.isToolOutputError(model_output),
             .record_completion = true,
-            .mark_mutation = (activity == .write or activity == .edit) and
+            .mark_mutation = mutates_workspace_files and
                 execution.status == .success and
                 !tool_result_errors.isToolOutputError(model_output),
             .status = runtime_execution_memory.persistedStatusForCurrentFxLocalResult(
@@ -608,4 +645,47 @@ test "drained batch feedback follows all tool results and keeps its source call"
     try std.testing.expectEqual(.user, suffix.items[3].role);
     try std.testing.expectEqualStrings("call_first", suffix.items[3].tool_call_id.?);
     try std.testing.expect(suffix.items[3].permission_feedback);
+}
+
+test "filesystem mutation executor classification includes every file mutator" {
+    const kinds = [_]tool_dispatch.ExecutorKind{
+        .write_file,
+        .edit_file,
+        .delete_file,
+        .rename_file,
+        .copy_file,
+        .create_folder,
+    };
+    for (kinds) |kind| {
+        try std.testing.expect(executorMutatesWorkspaceFiles(kind));
+    }
+}
+
+test "filesystem mutation executor classification excludes every non-file executor" {
+    const kinds = [_]tool_dispatch.ExecutorKind{
+        .list_files,
+        .glob_files,
+        .grep_files,
+        .read_file,
+        .read_tool_result,
+        .file_info,
+        .memory,
+        .semantic_search,
+        .open_file,
+        .web_fetch,
+        .web_search,
+        .run_command,
+        .terminal,
+        .skill,
+        .install_skill,
+        .subagent,
+        .mcp_search_tools,
+        .mcp_select_tool,
+        .mcp_features,
+        .ask_user_question,
+        .vision,
+    };
+    for (kinds) |kind| {
+        try std.testing.expect(!executorMutatesWorkspaceFiles(kind));
+    }
 }

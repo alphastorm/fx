@@ -5923,6 +5923,56 @@ test "processQueuedPrompt appends final verification after a successful mutation
     try expectBodyContains(&gateway, 1, "effects completed rather than merely began");
 }
 
+test "processQueuedPrompt excludes successful non-file write executors from final verification" {
+    const alloc = std.testing.allocator;
+    const tool_names = [_][]const u8{ "memory", "install_skill" };
+    for (tool_names) |tool_name| {
+        const calls = [_]ToolCall{toolCall("call_non_file_write", tool_name, "{}")};
+        const completions = [_]FakeCompletion{
+            .{ .tool_calls = &calls },
+            .{ .content = "Completed" },
+        };
+        var gateway = FakeGateway.init(alloc, &completions);
+        defer gateway.deinit();
+        var hooks = FakeAgentRuntimeDeps.init(alloc);
+        defer hooks.deinit();
+        var fixture = PromptFixture{};
+        var config = fixture.config();
+        config.final_verification_enabled = true;
+
+        try runFakePrompt(&gateway, &hooks, config, fixture.job());
+
+        try expectBodyNotContains(&gateway, 1, "Before finalizing, verify");
+    }
+}
+
+test "processQueuedPrompt injects once for mixed batches with a filesystem mutation" {
+    const alloc = std.testing.allocator;
+    const calls = [_]ToolCall{
+        toolCall("call_memory", "memory", "{}"),
+        toolCall("call_create", "create_folder", "{}"),
+        toolCall("call_read", "read_file", "{}"),
+    };
+    const completions = [_]FakeCompletion{
+        .{ .tool_calls = &calls },
+        .{ .content = "Verified" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+    var config = fixture.config();
+    config.final_verification_enabled = true;
+
+    try runFakePrompt(&gateway, &hooks, config, fixture.job());
+
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countNeedle(gateway.request_bodies.items[1], "Before finalizing, verify"),
+    );
+}
+
 test "processQueuedPrompt does not append final verification after a read-only batch" {
     const alloc = std.testing.allocator;
     const calls = [_]ToolCall{toolCall("call_read", "read_file", "{\"path\":\"a\"}")};
@@ -5981,6 +6031,28 @@ test "processQueuedPrompt excludes failed write results from final verification"
     hooks.exec_plans = &.{.{ .result = .{
         .status = .failure,
         .model_output = "write failed",
+    } }};
+    var fixture = PromptFixture{};
+
+    try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
+
+    try expectBodyNotContains(&gateway, 1, "Before finalizing, verify");
+}
+
+test "processQueuedPrompt excludes canonical tool error output from final verification" {
+    const alloc = std.testing.allocator;
+    const calls = [_]ToolCall{toolCall("call_1", "create_folder", "{}")};
+    const completions = [_]FakeCompletion{
+        .{ .tool_calls = &calls },
+        .{ .content = "Create failed" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    hooks.exec_plans = &.{.{ .result = .{
+        .status = .success,
+        .model_output = "Tool create_folder failed: permission denied",
     } }};
     var fixture = PromptFixture{};
 

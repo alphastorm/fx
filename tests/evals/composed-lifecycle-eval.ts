@@ -41,7 +41,7 @@ export interface ProcessResult {
   timedOut: boolean;
 }
 
-const FLAWED_POOL_SOURCE = `export interface PoolJob<T> {
+export const FLAWED_POOL_SOURCE = `export interface PoolJob<T> {
   run(signal: AbortSignal): Promise<T>;
   cleanup(): Promise<void>;
 }
@@ -84,7 +84,7 @@ export async function runBounded<T>(
 }
 `;
 
-const CORRECT_POOL_SOURCE = `export interface PoolJob<T> {
+export const CORRECT_POOL_SOURCE = `export interface PoolJob<T> {
   run(signal: AbortSignal): Promise<T>;
   cleanup(): Promise<void>;
 }
@@ -133,7 +133,7 @@ export async function runBounded<T>(
 }
 `;
 
-const VISIBLE_TEST_SOURCE = `import { describe, expect, test } from "bun:test";
+export const VISIBLE_TEST_SOURCE = `import { describe, expect, test } from "bun:test";
 import { runBounded, type PoolJob } from "./pool";
 
 function waitForAbort(signal: AbortSignal): Promise<never> {
@@ -211,7 +211,7 @@ describe("runBounded", () => {
 });
 `;
 
-const HELD_OUT_TEST_SOURCE = `import { expect, test } from "bun:test";
+export const HELD_OUT_TEST_SOURCE = `import { expect, test } from "bun:test";
 import { runBounded, type PoolJob } from "./pool";
 
 function waitForAbort(signal: AbortSignal): Promise<never> {
