@@ -9,6 +9,7 @@
  *   FX_LIFECYCLE_AB_CANDIDATE_BIN=/absolute/candidate \
  *   FX_LIFECYCLE_AB_MODEL=provider/model \
  *   FX_LIFECYCLE_AB_EFFORT=high \
+ *   FX_LIFECYCLE_AB_USE_FX_LOGIN=1 \
  *   bun test composed-lifecycle-eval.test.ts
  */
 import { spawn as nodeSpawn } from "node:child_process";
@@ -26,6 +27,7 @@ import {
   readFileSync,
   rmSync,
   statSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -44,7 +46,15 @@ Inspect pool.ts and pool.test.ts. Fix the implementation, add a regression test 
 
 export const MAX_LIFECYCLE_AB_TRIALS = 10;
 export const MAX_LIFECYCLE_AB_TIMEOUT_MS = 15 * 60 * 1000;
-export const LIFECYCLE_HAS_API_KEY = HAS_API_KEY;
+export function lifecycleHasLiveCredential(
+  env: NodeJS.ProcessEnv = process.env,
+): boolean {
+  const hasEnvironmentCredential = env === process.env
+    ? HAS_API_KEY
+    : Boolean(env.AI_GATEWAY_API_KEY || env.VERCEL_OIDC_TOKEN);
+  return hasEnvironmentCredential ||
+    env.FX_LIFECYCLE_AB_USE_FX_LOGIN === "1";
+}
 export const FINAL_VERIFICATION_TRACE_EVENT = "event=final_verification_injected";
 
 const PROCESS_TIMEOUT_GRACE_MS = 10_000;
@@ -55,6 +65,7 @@ const MAX_LIFECYCLE_SOURCE_BYTES = 256 * 1024;
 
 export type FixtureImplementation = "flawed" | "correct";
 export type ComparisonSide = "baseline" | "candidate";
+export type LifecycleCredentialMode = "environment" | "fx-login";
 
 export interface ProcessResult {
   stdout: string;
@@ -69,6 +80,7 @@ export interface LifecycleComparisonConfig {
   candidateBin: string;
   model: string;
   effort: string;
+  credentialMode: LifecycleCredentialMode;
   trials: number;
   outputDir: string;
   timeoutMs: number;
@@ -104,6 +116,7 @@ export interface LifecycleComparisonSummary {
   complete: boolean;
   model: string;
   effort: string;
+  credentialMode: LifecycleCredentialMode;
   trials: number;
   expectedTrialResults: number;
   completedTrialResults: number;
@@ -486,6 +499,8 @@ export function loadLifecycleComparisonConfig(
   const model = env.FX_LIFECYCLE_AB_MODEL;
   if (!model) throw new Error("FX_LIFECYCLE_AB_MODEL is required");
   const effort = env.FX_LIFECYCLE_AB_EFFORT?.trim() || "high";
+  const credentialMode: LifecycleCredentialMode =
+    env.FX_LIFECYCLE_AB_USE_FX_LOGIN === "1" ? "fx-login" : "environment";
   const trials = Number(env.FX_LIFECYCLE_AB_TRIALS ?? "3");
   if (
     !Number.isInteger(trials) ||
@@ -512,6 +527,7 @@ export function loadLifecycleComparisonConfig(
     candidateBin,
     model,
     effort,
+    credentialMode,
     trials,
     outputDir: env.FX_LIFECYCLE_AB_OUTPUT_DIR ??
       mkdtempSync(join(tmpdir(), "fx-composed-lifecycle-ab-")),
@@ -605,6 +621,7 @@ function writeComparisonSummary(
     complete,
     model: config.model,
     effort: config.effort,
+    credentialMode: config.credentialMode,
     trials: config.trials,
     expectedTrialResults: config.trials * 2,
     completedTrialResults: trialResults.length,
@@ -663,7 +680,10 @@ async function runLifecycleTrial(
     throw new Error("held-out verifier became visible before the fx run");
   }
 
-  const home = createEvalHome(config.effort);
+  const home = createLifecycleEvalHome(
+    config.effort,
+    config.credentialMode,
+  );
   let fx: ProcessResult;
   try {
     fx = await runProcess(
@@ -785,25 +805,52 @@ async function runLifecycleTrial(
   return result;
 }
 
-function createEvalHome(effort: string): string {
+export function createLifecycleEvalHome(
+  effort: string,
+  credentialMode: LifecycleCredentialMode,
+  sourceHome: string | undefined = process.env.HOME,
+): string {
   const home = mkdtempSync(join(tmpdir(), "fx-composed-lifecycle-home-"));
-  mkdirSync(join(home, ".fx"), { recursive: true, mode: 0o700 });
-  writeFileSync(
-    join(home, ".fx", "settings.json"),
-    JSON.stringify({
-      effort,
-      fast_mode: false,
-      permission_mode: "auto",
-      permission: {
-        bash: "allow",
-        edit: "allow",
-        read: "allow",
-        write: "allow",
-      },
-    }) + "\n",
-    { mode: 0o600 },
-  );
-  return home;
+  try {
+    mkdirSync(join(home, ".fx"), { recursive: true, mode: 0o700 });
+    if (credentialMode === "fx-login") {
+      if (process.platform !== "darwin") {
+        throw new Error("Fx login A/B authentication requires macOS Keychain");
+      }
+      if (!sourceHome) {
+        throw new Error("Fx login A/B authentication requires HOME");
+      }
+      const sourceKeychains = join(sourceHome, "Library", "Keychains");
+      if (!statSync(sourceKeychains).isDirectory()) {
+        throw new Error("Fx login A/B authentication requires a Keychains directory");
+      }
+      mkdirSync(join(home, "Library"), { mode: 0o700 });
+      symlinkSync(
+        sourceKeychains,
+        join(home, "Library", "Keychains"),
+        "dir",
+      );
+    }
+    writeFileSync(
+      join(home, ".fx", "settings.json"),
+      JSON.stringify({
+        effort,
+        fast_mode: false,
+        permission_mode: "auto",
+        permission: {
+          bash: "allow",
+          edit: "allow",
+          read: "allow",
+          write: "allow",
+        },
+      }) + "\n",
+      { mode: 0o600 },
+    );
+    return home;
+  } catch (error) {
+    rmSync(home, { recursive: true, force: true });
+    throw error;
+  }
 }
 
 async function versionFor(binaryPath: string): Promise<string> {

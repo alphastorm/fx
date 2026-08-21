@@ -1,7 +1,10 @@
 import { describe, expect, test } from "bun:test";
 import {
   existsSync,
+  lstatSync,
+  mkdirSync,
   mkdtempSync,
+  readFileSync,
   rmSync,
   statSync,
   symlinkSync,
@@ -10,12 +13,13 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
-  LIFECYCLE_HAS_API_KEY,
+  createLifecycleEvalHome,
   LIFECYCLE_TASK_PROMPT,
   MAX_LIFECYCLE_AB_TRIALS,
   comparisonOrder,
   comparisonTimeoutMs,
   loadLifecycleComparisonConfig,
+  lifecycleHasLiveCredential,
   prepareHeldOutLifecycleWorkspace,
   redactKnownSecrets,
   runBunTestFile,
@@ -24,6 +28,8 @@ import {
   writeLifecycleFixture,
   type LifecycleComparisonConfig,
 } from "./composed-lifecycle-eval";
+
+const darwinTest = test.skipIf(process.platform !== "darwin");
 
 describe("composed lifecycle fixture", () => {
   test("frozen flaw passes visible tests and fails the held-out transition", async () => {
@@ -115,6 +121,38 @@ describe("composed lifecycle A/B harness", () => {
     expect(comparisonOrder(1)).toEqual(["candidate", "baseline"]);
   });
 
+  test("recognizes explicit Fx login authentication", () => {
+    expect(
+      lifecycleHasLiveCredential({
+        FX_LIFECYCLE_AB_USE_FX_LOGIN: "1",
+      }),
+    ).toBe(true);
+  });
+
+  darwinTest("isolates settings while linking the login keychain", () => {
+    const sourceHome = mkdtempSync(join(tmpdir(), "fx-lifecycle-source-home-"));
+    mkdirSync(join(sourceHome, "Library", "Keychains"), {
+      recursive: true,
+      mode: 0o700,
+    });
+    const evalHome = createLifecycleEvalHome(
+      "high",
+      "fx-login",
+      sourceHome,
+    );
+    try {
+      expect(
+        lstatSync(join(evalHome, "Library", "Keychains")).isSymbolicLink(),
+      ).toBe(true);
+      expect(
+        readFileSync(join(evalHome, ".fx", "settings.json"), "utf8"),
+      ).toContain("\"effort\":\"high\"");
+    } finally {
+      rmSync(evalHome, { recursive: true, force: true });
+      rmSync(sourceHome, { recursive: true, force: true });
+    }
+  });
+
   test("bounds aggregate model-backed trials", () => {
     expect(() =>
       loadLifecycleComparisonConfig({
@@ -132,6 +170,7 @@ describe("composed lifecycle A/B harness", () => {
       candidateBin: process.execPath,
       model: "provider/model",
       effort: "high",
+      credentialMode: "environment",
       trials: 1,
       outputDir: "/tmp/unused",
       timeoutMs: 1_000,
@@ -148,6 +187,7 @@ describe("composed lifecycle A/B harness", () => {
         candidateBin: process.execPath,
         model: "provider/model",
         effort: "high",
+        credentialMode: "environment",
         trials: 1,
         outputDir,
         timeoutMs: 1_000,
@@ -181,7 +221,7 @@ const hasLiveConfig = Boolean(
   process.env.FX_LIFECYCLE_AB_BASELINE_BIN &&
     process.env.FX_LIFECYCLE_AB_CANDIDATE_BIN &&
     process.env.FX_LIFECYCLE_AB_MODEL &&
-    LIFECYCLE_HAS_API_KEY,
+    lifecycleHasLiveCredential(),
 );
 const liveConfig = hasLiveConfig ? loadLifecycleComparisonConfig() : undefined;
 const liveTest = liveConfig ? test : test.skip;
