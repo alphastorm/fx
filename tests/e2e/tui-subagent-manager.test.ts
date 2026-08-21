@@ -1539,7 +1539,8 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
       const externalId = "always_write_external";
       const gateway = startDynamicFakeGateway((body) => {
         const latest = latestPrompt(body);
-        if (latest.includes(`"toolCallId":"${externalId}"`)) {
+        const serialized = JSON.stringify(body);
+        if (serialized.includes(`"toolCallId":"${externalId}"`)) {
           return fakeGatewayFinalText("ALWAYS_WRITE_EXTERNAL_DONE");
         }
         if (latest.includes(externalPrompt)) {
@@ -1548,7 +1549,7 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
             content: "EXTERNAL\n",
           });
         }
-        if (latest.includes(`"toolCallId":"${secondId}"`)) {
+        if (serialized.includes(`"toolCallId":"${secondId}"`)) {
           return fakeGatewayFinalText("ALWAYS_WRITE_SECOND_DONE");
         }
         if (latest.includes(secondPrompt)) {
@@ -1557,7 +1558,7 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
             content: "SECOND\n",
           });
         }
-        if (latest.includes(`"toolCallId":"${firstId}"`)) {
+        if (serialized.includes(`"toolCallId":"${firstId}"`)) {
           return fakeGatewayFinalText("ALWAYS_WRITE_FIRST_DONE");
         }
         if (latest.includes(childPrompt)) {
@@ -1566,7 +1567,7 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
             content: "FIRST\n",
           });
         }
-        if (latest.includes(`"toolCallId":"${createId}"`)) {
+        if (serialized.includes(`"toolCallId":"${createId}"`)) {
           return fakeGatewayFinalText("ALWAYS_WRITE_PARENT_READY");
         }
         return fakeGatewayToolCall(createId, "subagent", {
